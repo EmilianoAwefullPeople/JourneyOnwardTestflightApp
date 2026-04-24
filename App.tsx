@@ -1,20 +1,68 @@
+// App.tsx
+// Root component with deferred navigation initialization
+// This prevents "expected dynamic type 'boolean', but had type 'string'" errors
+
+import React, { useState, useEffect } from 'react';
 import { StatusBar } from 'expo-status-bar';
-import { StyleSheet, Text, View } from 'react-native';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { AppProvider } from './src/context/AppContext';
+import { ProgressProvider } from './src/context/ProgressContext';
+import { ThemeProvider, useTheme } from './src/context/ThemeContext';
+import LoadingScreen from './src/screens/LoadingScreen';
+import DailyAppOpenCountryCapture from './src/components/DailyAppOpenCountryCapture';
+
+// DO NOT import AppNavigator at top level - lazy-load it instead
+// This prevents native module registration during app startup
+
+const AppContent: React.FC = () => {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    // Critical: Delay navigation until React Native bridge is ready
+    // This prevents native modules from initializing too early
+    const timer = setTimeout(() => {
+      setReady(true);
+    }, 100);
+    return () => clearTimeout(timer);
+  }, []);
+
+  if (!ready) {
+    return (
+      <>
+        <StatusBarWrapper />
+        <LoadingScreen />
+      </>
+    );
+  }
+
+  const AppNavigator = require('./src/navigation/AppNavigator').AppNavigator;
+  return (
+    <>
+      <StatusBarWrapper />
+      <DailyAppOpenCountryCapture />
+      <AppNavigator />
+    </>
+  );
+};
+
+const StatusBarWrapper: React.FC = () => {
+  const { isDark } = useTheme();
+  return <StatusBar style={isDark ? 'light' : 'dark'} />;
+};
 
 export default function App() {
   return (
-    <View style={styles.container}>
-      <Text>Open up App.tsx to start working on your app!</Text>
-      <StatusBar style="auto" />
-    </View>
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <AppProvider>
+        <ThemeProvider>
+          <SafeAreaProvider>
+            <ProgressProvider>
+              <AppContent />
+            </ProgressProvider>
+          </SafeAreaProvider>
+        </ThemeProvider>
+      </AppProvider>
+    </GestureHandlerRootView>
   );
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#fff',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-});
