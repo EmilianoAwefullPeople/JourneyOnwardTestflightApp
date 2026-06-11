@@ -100,6 +100,9 @@ export const SPACING = {
 export const FONTS = {
   inter: 'Inter',
   playfairDisplay: 'Playfair Display',
+  permanentMarker: 'PermanentMarker_400Regular',
+  caveat: 'Caveat_400Regular',
+  mono: 'Courier New',
 };
 
 export const FONT_SIZES = {

@@ -5,12 +5,13 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Entry } from '../models/Entry';
 import { Journal } from '../models/Journal';
 import { TripAlbum } from '../models/TripAlbum';
+import { Postcard, PostcardPhotoTransform } from '../models/Postcard';
 import { isTimestampInAlbumRange } from '../utils/albumUtils';
 import { logger } from '../utils/logger';
-import { deleteAllPersistentMedia, deletePersistentMediaForEntry, resolveMediaPath } from './mediaStorage';
+import { deleteAllPersistentMedia, deletePersistentMediaForEntry, resolveMediaPath, toRelativePathArray } from './mediaStorage';
 
 /** Bump when adding migrations; must match highest version set by migrations / resetDatabase. */
-const TARGET_SCHEMA_VERSION = 7;
+const TARGET_SCHEMA_VERSION = 15;
 const REQUIRED_ENTRY_COLUMNS: Array<{ name: string; sql: string }> = [
   { name: 'is_awe', sql: 'is_awe INTEGER' },
   { name: 'weather', sql: 'weather TEXT' },
@@ -21,6 +22,7 @@ const REQUIRED_ENTRY_COLUMNS: Array<{ name: string; sql: string }> = [
   { name: 'country', sql: 'country TEXT' },
   { name: 'city', sql: 'city TEXT' },
   { name: 'photo_color_palettes', sql: 'photo_color_palettes TEXT' },
+  { name: 'thumb_paths', sql: 'thumb_paths TEXT' },
 ];
 
 // Lazy-load SQLite only when needed
@@ -28,6 +30,8 @@ let SQLite: any = null;
 let db: any = null;
 let dbInitialized = false;
 let dbInitPromise: Promise<void> | null = null;
+/** In-flight open + migrate; prevents parallel `openDatabaseAsync` from `Promise.all` data loads. */
+let dbOpeningPromise: Promise<void> | null = null;
 
 // Force reset database connection
 const resetDatabaseConnection = () => {
@@ -114,6 +118,8 @@ const resetDatabase = async (database: any): Promise<void> => {
   await database.execAsync('DROP TABLE IF EXISTS entries;');
   await database.execAsync('DROP TABLE IF EXISTS journals;');
   await database.execAsync('DROP TABLE IF EXISTS trip_albums;');
+  await database.execAsync('DROP TABLE IF EXISTS postcards;');
+  await database.execAsync('DROP TABLE IF EXISTS user_profile;');
   await database.execAsync('DROP TABLE IF EXISTS schema_version;');
   
   // Create schema_version table
@@ -135,14 +141,11 @@ const resetDatabase = async (database: any): Promise<void> => {
       photo_paths TEXT,
       media_paths TEXT,
       storage_urls TEXT,
-      valence REAL,
-      arousal REAL,
       emotion_labels TEXT,
       emotion_note TEXT,
       timestamp TEXT NOT NULL,
       latitude REAL,
       longitude REAL,
-      cycle_type TEXT,
       album_id TEXT,
       journal_id TEXT,
       weather TEXT,
@@ -152,6 +155,7 @@ const resetDatabase = async (database: any): Promise<void> => {
       country TEXT,
       city TEXT,
       photo_color_palettes TEXT,
+      thumb_paths TEXT,
       is_draft INTEGER NOT NULL DEFAULT 0,
       is_awe INTEGER,
       created_at TEXT,
@@ -166,12 +170,13 @@ const resetDatabase = async (database: any): Promise<void> => {
       title TEXT,
       content TEXT NOT NULL,
       timestamp TEXT NOT NULL,
-      cycle_type TEXT NOT NULL,
       linked_entry_id TEXT,
       emotion_responses TEXT,
       ai_prompts TEXT,
       latitude REAL,
       longitude REAL,
+      country TEXT,
+      city TEXT,
       album_id TEXT,
       created_at TEXT,
       updated_at TEXT
@@ -204,8 +209,52 @@ const resetDatabase = async (database: any): Promise<void> => {
     );
   `);
   
-  // Set schema version to 7 (adds photo_color_palettes on entries)
-  await setSchemaVersion(database, 7);
+  // Create postcards table
+  await database.execAsync(`
+    CREATE TABLE postcards (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      template_id TEXT NOT NULL,
+      aspect_ratio TEXT NOT NULL DEFAULT '4:5',
+      top_photo_path TEXT,
+      bottom_photo_path TEXT,
+      top_label TEXT NOT NULL DEFAULT '',
+      bottom_label TEXT NOT NULL DEFAULT '',
+      downloaded INTEGER NOT NULL DEFAULT 0,
+      top_photo_transform TEXT,
+      bottom_photo_transform TEXT,
+      photo3_path TEXT,
+      photo3_transform TEXT,
+      photo4_path TEXT,
+      photo4_transform TEXT,
+      template_data TEXT
+    );
+  `);
+
+  // Create user_profile table
+  await database.execAsync(`
+    CREATE TABLE user_profile (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      traveler_tier TEXT,
+      intent TEXT,
+      email TEXT,
+      phone TEXT,
+      onboarding_completed_at TEXT,
+      onboarding_path_taken TEXT,
+      tried_travel_mode INTEGER NOT NULL DEFAULT 0,
+      tried_journal_entry INTEGER NOT NULL DEFAULT 0,
+      tried_gallery_sync INTEGER NOT NULL DEFAULT 0,
+      tried_trip_album INTEGER NOT NULL DEFAULT 0,
+      tried_journey_recap INTEGER NOT NULL DEFAULT 0,
+      tried_postcards INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT,
+      updated_at TEXT
+    );
+  `);
+
+  await setSchemaVersion(database, 15);
   logger.log('Database reset completed with clean schema');
 };
 
@@ -258,8 +307,8 @@ const rescueLegacySchema = async (database: any): Promise<void> => {
   try {
     legacyRows = await database.getAllAsync(
       `SELECT id, type, title, description, media_type, photo_paths, media_paths,
-              storage_urls, valence, arousal, emotion_labels, emotion_note,
-              timestamp, latitude, longitude, cycle_type, album_id, journal_id,
+              storage_urls, emotion_labels, emotion_note,
+              timestamp, latitude, longitude, album_id, journal_id,
               weather, temperature_celsius, altitude_meters, season,
               is_draft, is_awe, created_at, updated_at
        FROM entries`
@@ -285,14 +334,11 @@ const rescueLegacySchema = async (database: any): Promise<void> => {
       photo_paths TEXT,
       media_paths TEXT,
       storage_urls TEXT,
-      valence REAL,
-      arousal REAL,
       emotion_labels TEXT,
       emotion_note TEXT,
       timestamp TEXT NOT NULL,
       latitude REAL,
       longitude REAL,
-      cycle_type TEXT,
       album_id TEXT,
       journal_id TEXT,
       weather TEXT,
@@ -324,17 +370,17 @@ const rescueLegacySchema = async (database: any): Promise<void> => {
       await database.runAsync(
         `INSERT OR IGNORE INTO entries (
           id, type, title, description, media_type, photo_paths, media_paths,
-          storage_urls, valence, arousal, emotion_labels, emotion_note,
-          timestamp, latitude, longitude, cycle_type, album_id, journal_id,
+          storage_urls, emotion_labels, emotion_note,
+          timestamp, latitude, longitude, album_id, journal_id,
           weather, temperature_celsius, altitude_meters, season, country, city,
           photo_color_palettes, is_draft, is_awe, created_at, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
           row.id, row.type, row.title ?? null, row.description,
           row.media_type, row.photo_paths, row.media_paths, row.storage_urls,
-          row.valence ?? null, row.arousal ?? null, row.emotion_labels, row.emotion_note ?? null,
+          row.emotion_labels, row.emotion_note ?? null,
           row.timestamp, row.latitude ?? null, row.longitude ?? null,
-          row.cycle_type ?? null, row.album_id ?? null, row.journal_id ?? null,
+          row.album_id ?? null, row.journal_id ?? null,
           row.weather ?? null, row.temperature_celsius ?? null,
           row.altitude_meters ?? null, row.season ?? null,
           row.country ?? null,
@@ -502,6 +548,261 @@ const migrateDatabase = async (database: any): Promise<void> => {
       continue;
     }
 
+    if (currentVersion === 7) {
+      const hasJournalCountry = await columnExists(database, 'journals', 'country');
+      if (!hasJournalCountry) {
+        await database.execAsync('ALTER TABLE journals ADD COLUMN country TEXT;');
+        logger.log('Migration 7→8: Added country column to journals');
+      }
+      const hasJournalCity = await columnExists(database, 'journals', 'city');
+      if (!hasJournalCity) {
+        await database.execAsync('ALTER TABLE journals ADD COLUMN city TEXT;');
+        logger.log('Migration 7→8: Added city column to journals');
+      }
+      await setSchemaVersion(database, 8);
+      currentVersion = 8;
+      logger.log('Migration 7→8 completed');
+      continue;
+    }
+
+    if (currentVersion === 8) {
+      await database.execAsync(`
+        CREATE TABLE IF NOT EXISTS postcards (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          template_id TEXT NOT NULL,
+          aspect_ratio TEXT NOT NULL DEFAULT '4:5',
+          top_photo_path TEXT,
+          bottom_photo_path TEXT,
+          top_label TEXT NOT NULL DEFAULT '',
+          bottom_label TEXT NOT NULL DEFAULT '',
+          downloaded INTEGER NOT NULL DEFAULT 0,
+          top_photo_transform TEXT,
+          bottom_photo_transform TEXT
+        );
+      `);
+      await setSchemaVersion(database, 9);
+      currentVersion = 9;
+      logger.log('Migration 8→9 completed');
+      continue;
+    }
+
+    if (currentVersion === 9) {
+      const hasTopTransform = await columnExists(database, 'postcards', 'top_photo_transform');
+      if (!hasTopTransform) {
+        await database.execAsync('ALTER TABLE postcards ADD COLUMN top_photo_transform TEXT;');
+        logger.log('Migration 9→10: Added top_photo_transform to postcards');
+      }
+      const hasBottomTransform = await columnExists(database, 'postcards', 'bottom_photo_transform');
+      if (!hasBottomTransform) {
+        await database.execAsync('ALTER TABLE postcards ADD COLUMN bottom_photo_transform TEXT;');
+        logger.log('Migration 9→10: Added bottom_photo_transform to postcards');
+      }
+      await setSchemaVersion(database, 10);
+      currentVersion = 10;
+      logger.log('Migration 9→10 completed');
+      continue;
+    }
+
+    if (currentVersion === 10) {
+      await database.execAsync(`
+        CREATE TABLE IF NOT EXISTS entries_new (
+          id TEXT PRIMARY KEY,
+          type TEXT NOT NULL,
+          title TEXT,
+          description TEXT,
+          media_type TEXT,
+          photo_paths TEXT,
+          media_paths TEXT,
+          storage_urls TEXT,
+          emotion_labels TEXT,
+          emotion_note TEXT,
+          timestamp TEXT NOT NULL,
+          latitude REAL,
+          longitude REAL,
+          album_id TEXT,
+          journal_id TEXT,
+          weather TEXT,
+          temperature_celsius REAL,
+          altitude_meters REAL,
+          season TEXT,
+          country TEXT,
+          city TEXT,
+          photo_color_palettes TEXT,
+          is_draft INTEGER NOT NULL DEFAULT 0,
+          is_awe INTEGER,
+          created_at TEXT,
+          updated_at TEXT
+        );
+      `);
+      await database.execAsync(`
+        INSERT INTO entries_new (
+          id, type, title, description, media_type, photo_paths, media_paths, storage_urls,
+          emotion_labels, emotion_note, timestamp, latitude, longitude, album_id,
+          journal_id, weather, temperature_celsius, altitude_meters, season, country, city,
+          photo_color_palettes, is_draft, is_awe, created_at, updated_at
+        )
+        SELECT
+          id, type, title, description, media_type, photo_paths, media_paths, storage_urls,
+          emotion_labels, emotion_note, timestamp, latitude, longitude, album_id,
+          journal_id, weather, temperature_celsius, altitude_meters, season, country, city,
+          photo_color_palettes, is_draft, is_awe, created_at, updated_at
+        FROM entries;
+      `);
+      await database.execAsync('DROP TABLE entries;');
+      await database.execAsync('ALTER TABLE entries_new RENAME TO entries;');
+      await setSchemaVersion(database, 11);
+      currentVersion = 11;
+      logger.log('Migration 10→11 completed (removed valence/arousal)');
+      continue;
+    }
+
+    if (currentVersion === 11) {
+      await database.execAsync(`
+        CREATE TABLE IF NOT EXISTS entries_new (
+          id TEXT PRIMARY KEY,
+          type TEXT NOT NULL,
+          title TEXT,
+          description TEXT,
+          media_type TEXT,
+          photo_paths TEXT,
+          media_paths TEXT,
+          storage_urls TEXT,
+          emotion_labels TEXT,
+          emotion_note TEXT,
+          timestamp TEXT NOT NULL,
+          latitude REAL,
+          longitude REAL,
+          album_id TEXT,
+          journal_id TEXT,
+          weather TEXT,
+          temperature_celsius REAL,
+          altitude_meters REAL,
+          season TEXT,
+          country TEXT,
+          city TEXT,
+          photo_color_palettes TEXT,
+          is_draft INTEGER NOT NULL DEFAULT 0,
+          is_awe INTEGER,
+          created_at TEXT,
+          updated_at TEXT
+        );
+      `);
+      await database.execAsync(`
+        INSERT INTO entries_new (
+          id, type, title, description, media_type, photo_paths, media_paths, storage_urls,
+          emotion_labels, emotion_note, timestamp, latitude, longitude, album_id,
+          journal_id, weather, temperature_celsius, altitude_meters, season, country, city,
+          photo_color_palettes, is_draft, is_awe, created_at, updated_at
+        )
+        SELECT
+          id, type, title, description, media_type, photo_paths, media_paths, storage_urls,
+          emotion_labels, emotion_note, timestamp, latitude, longitude, album_id,
+          journal_id, weather, temperature_celsius, altitude_meters, season, country, city,
+          photo_color_palettes, is_draft, is_awe, created_at, updated_at
+        FROM entries;
+      `);
+      await database.execAsync('DROP TABLE entries;');
+      await database.execAsync('ALTER TABLE entries_new RENAME TO entries;');
+
+      await database.execAsync(`
+        CREATE TABLE IF NOT EXISTS journals_new (
+          id TEXT PRIMARY KEY,
+          title TEXT,
+          content TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          linked_entry_id TEXT,
+          emotion_responses TEXT,
+          ai_prompts TEXT,
+          latitude REAL,
+          longitude REAL,
+          country TEXT,
+          city TEXT,
+          album_id TEXT,
+          created_at TEXT,
+          updated_at TEXT
+        );
+      `);
+      await database.execAsync(`
+        INSERT INTO journals_new (
+          id, title, content, timestamp, linked_entry_id,
+          emotion_responses, ai_prompts, latitude, longitude, country, city, album_id, created_at, updated_at
+        )
+        SELECT
+          id, title, content, timestamp, linked_entry_id,
+          emotion_responses, ai_prompts, latitude, longitude, country, city, album_id, created_at, updated_at
+        FROM journals;
+      `);
+      await database.execAsync('DROP TABLE journals;');
+      await database.execAsync('ALTER TABLE journals_new RENAME TO journals;');
+
+      await setSchemaVersion(database, 12);
+      currentVersion = 12;
+      logger.log('Migration 11→12 completed (removed cycle_type)');
+      continue;
+    }
+
+    if (currentVersion === 12) {
+      await database.execAsync(`
+        CREATE TABLE IF NOT EXISTS user_profile (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          traveler_tier TEXT,
+          intent TEXT,
+          email TEXT,
+          phone TEXT,
+          onboarding_completed_at TEXT,
+          onboarding_path_taken TEXT,
+          tried_travel_mode INTEGER NOT NULL DEFAULT 0,
+          tried_journal_entry INTEGER NOT NULL DEFAULT 0,
+          tried_gallery_sync INTEGER NOT NULL DEFAULT 0,
+          tried_trip_album INTEGER NOT NULL DEFAULT 0,
+          tried_journey_recap INTEGER NOT NULL DEFAULT 0,
+          tried_postcards INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT,
+          updated_at TEXT
+        );
+      `);
+      await setSchemaVersion(database, 13);
+      currentVersion = 13;
+      logger.log('Migration 12→13 completed (added user_profile table)');
+      continue;
+    }
+
+    if (currentVersion === 13) {
+      const hasThumbPaths = await columnExists(database, 'entries', 'thumb_paths');
+      if (!hasThumbPaths) {
+        await database.execAsync('ALTER TABLE entries ADD COLUMN thumb_paths TEXT;');
+        logger.log('Migration 13→14: Added thumb_paths column to entries');
+      }
+      await setSchemaVersion(database, 14);
+      currentVersion = 14;
+      logger.log('Migration 13→14 completed');
+      continue;
+    }
+
+    if (currentVersion === 14) {
+      const newPostcardColumns: Array<{ name: string; sql: string }> = [
+        { name: 'photo3_path', sql: 'photo3_path TEXT' },
+        { name: 'photo3_transform', sql: 'photo3_transform TEXT' },
+        { name: 'photo4_path', sql: 'photo4_path TEXT' },
+        { name: 'photo4_transform', sql: 'photo4_transform TEXT' },
+        { name: 'template_data', sql: 'template_data TEXT' },
+      ];
+      for (const col of newPostcardColumns) {
+        const exists = await columnExists(database, 'postcards', col.name);
+        if (!exists) {
+          await database.execAsync(`ALTER TABLE postcards ADD COLUMN ${col.sql};`);
+          logger.log(`Migration 14→15: Added ${col.name} to postcards`);
+        }
+      }
+      await setSchemaVersion(database, 15);
+      currentVersion = 15;
+      logger.log('Migration 14→15 completed');
+      continue;
+    }
+
     logger.warn('migrateDatabase: unhandled schema version, stopping', { currentVersion });
     break;
   }
@@ -523,38 +824,62 @@ const migrateDatabase = async (database: any): Promise<void> => {
 };
 
 const initializeDatabase = async (database: any) => {
-  // Always run migrations to check for schema issues (even if already initialized)
-  // This ensures we catch legacy schemas on app restart
+  await database.execAsync('PRAGMA journal_mode=WAL;');
+  await database.execAsync('PRAGMA synchronous=NORMAL;');
   await migrateDatabase(database);
-  
+  try {
+    await database.execAsync('CREATE INDEX IF NOT EXISTS idx_entries_timestamp ON entries(timestamp);');
+    await database.execAsync('CREATE INDEX IF NOT EXISTS idx_entries_album_id ON entries(album_id);');
+    await database.execAsync('CREATE INDEX IF NOT EXISTS idx_entries_is_draft ON entries(is_draft);');
+    // Composite index for all backfill queries that filter media_type + is_draft before ordering by timestamp.
+    await database.execAsync('CREATE INDEX IF NOT EXISTS idx_entries_media_draft_ts ON entries(media_type, is_draft, timestamp);');
+  } catch (e) {
+    logger.warn('initializeDatabase: failed to create performance indices', e);
+  }
   if (!dbInitialized) {
     dbInitialized = true;
   }
 };
 
 const getDatabase = async () => {
-  if (!db) {
-    try {
-      const sqlite = await loadSQLite();
-      
-      // Close any existing connection and reset state
-      resetDatabaseConnection();
-      
-      // Open fresh database connection
-      db = await sqlite.openDatabaseAsync('journeyon.db');
-      
-      // Initialize database only once
-      if (!dbInitPromise) {
-        dbInitPromise = initializeDatabase(db);
-      }
-      await dbInitPromise;
-    } catch (error) {
-      logger.error('Error initializing database:', error);
-      // Reset connection on error to allow retry
-      resetDatabaseConnection();
-      throw error;
-    }
+  if (db) {
+    return db;
   }
+
+  if (!dbOpeningPromise) {
+    dbOpeningPromise = (async () => {
+      // Local handle only — do not assign module `db` until migrations finish, otherwise
+      // concurrent `getDatabase()` can return the connection while migrateDatabase is still running.
+      let opened: any = null;
+      try {
+        const sqlite = await loadSQLite();
+        // Close any existing connection and reset in-memory init flags (db is usually null here).
+        resetDatabaseConnection();
+
+        opened = await sqlite.openDatabaseAsync('journeyon.db');
+        dbInitPromise = initializeDatabase(opened);
+        await dbInitPromise;
+        db = opened;
+        opened = null;
+      } catch (error) {
+        logger.error('Error initializing database:', error);
+        if (opened) {
+          try {
+            await opened.closeAsync?.();
+          } catch {
+            /* ignore close errors on failed init */
+          }
+          opened = null;
+        }
+        resetDatabaseConnection();
+        throw error;
+      } finally {
+        dbOpeningPromise = null;
+      }
+    })();
+  }
+
+  await dbOpeningPromise;
   return db;
 };
 
@@ -569,13 +894,96 @@ export const getDatabaseSchemaVersion = async (): Promise<number> => {
 };
 
 /**
- * Clears all app data (entries, journals, trip albums). Used for "Restart app".
+ * Clears all app data (entries, journals, trip albums, user_profile). Used for "Restart app".
  * Does not close the DB connection; next reads will see empty tables.
  */
 export const clearAllData = async (): Promise<void> => {
   const database = await getDatabase();
   await resetDatabase(database);
   deleteAllPersistentMedia();
+};
+
+// User Profile Operations
+
+export const upsertUserProfile = async (profile: import('../models/UserProfile').UserProfile): Promise<void> => {
+  try {
+    const database = await getDatabase();
+    const now = new Date().toISOString();
+    await database.runAsync(
+      `INSERT INTO user_profile (
+        id, name, traveler_tier, intent, email, phone,
+        onboarding_completed_at, onboarding_path_taken,
+        tried_travel_mode, tried_journal_entry, tried_gallery_sync,
+        tried_trip_album, tried_journey_recap, tried_postcards,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        traveler_tier = excluded.traveler_tier,
+        intent = excluded.intent,
+        email = excluded.email,
+        phone = excluded.phone,
+        onboarding_completed_at = excluded.onboarding_completed_at,
+        onboarding_path_taken = excluded.onboarding_path_taken,
+        tried_travel_mode = excluded.tried_travel_mode,
+        tried_journal_entry = excluded.tried_journal_entry,
+        tried_gallery_sync = excluded.tried_gallery_sync,
+        tried_trip_album = excluded.tried_trip_album,
+        tried_journey_recap = excluded.tried_journey_recap,
+        tried_postcards = excluded.tried_postcards,
+        updated_at = excluded.updated_at`,
+      [
+        profile.id,
+        profile.name,
+        profile.travelerTier ?? null,
+        stringify(profile.intent),
+        profile.email ?? null,
+        profile.phone ?? null,
+        profile.onboardingCompletedAt ?? null,
+        profile.onboardingPathTaken ?? null,
+        profile.triedTravelMode ? 1 : 0,
+        profile.triedJournalEntry ? 1 : 0,
+        profile.triedGallerySync ? 1 : 0,
+        profile.triedTripAlbum ? 1 : 0,
+        profile.triedJourneyRecap ? 1 : 0,
+        profile.triedPostcards ? 1 : 0,
+        profile.createdAt ?? now,
+        now,
+      ]
+    );
+  } catch (error) {
+    logger.error('Error upserting user profile:', error);
+    throw error;
+  }
+};
+
+export const getUserProfile = async (): Promise<import('../models/UserProfile').UserProfile | null> => {
+  try {
+    const database = await getDatabase();
+    const row: any = await database.getFirstAsync('SELECT * FROM user_profile LIMIT 1');
+    if (!row) return null;
+    return {
+      id: row.id,
+      name: row.name,
+      travelerTier: row.traveler_tier ?? undefined,
+      intent: parse(row.intent) ?? [],
+      email: row.email ?? undefined,
+      phone: row.phone ?? undefined,
+      onboardingCompletedAt: row.onboarding_completed_at ?? undefined,
+      onboardingPathTaken: row.onboarding_path_taken ?? undefined,
+      triedTravelMode: Boolean(row.tried_travel_mode),
+      triedJournalEntry: Boolean(row.tried_journal_entry),
+      triedGallerySync: Boolean(row.tried_gallery_sync),
+      triedTripAlbum: Boolean(row.tried_trip_album),
+      triedJourneyRecap: Boolean(row.tried_journey_recap),
+      triedPostcards: Boolean(row.tried_postcards),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  } catch (error) {
+    logger.error('Error getting user profile:', error);
+    return null;
+  }
 };
 
 // Helper functions for JSON serialization
@@ -650,13 +1058,13 @@ export const assignExistingItemsToAlbum = async (album: TripAlbum): Promise<void
     const albumId = album.id;
 
     for (const entry of entries) {
-      if (isTimestampInAlbumRange(entry.timestamp, album.startDate, album.endDate)) {
+      if (!entry.albumId && isTimestampInAlbumRange(entry.timestamp, album.startDate, album.endDate)) {
         await updateEntry({ ...entry, albumId });
       }
     }
 
     for (const journal of journals) {
-      if (isTimestampInAlbumRange(journal.timestamp, album.startDate, album.endDate)) {
+      if (!journal.albumId && isTimestampInAlbumRange(journal.timestamp, album.startDate, album.endDate)) {
         await updateJournal({ ...journal, albumId });
       }
     }
@@ -792,27 +1200,24 @@ export const createEntry = async (entry: Entry): Promise<void> => {
     database.runAsync(
       `INSERT INTO entries (
         id, type, title, description, media_type, photo_paths, media_paths, storage_urls,
-        valence, arousal, emotion_labels, emotion_note, timestamp, latitude, longitude, cycle_type,
+        emotion_labels, emotion_note, timestamp, latitude, longitude,
         album_id, journal_id, weather, temperature_celsius, altitude_meters, season, country, city,
-        photo_color_palettes, is_draft, is_awe, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        photo_color_palettes, thumb_paths, is_draft, is_awe, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         entry.id,
         entry.type,
         entry.title || null,
         entry.description,
         entry.mediaType,
-        stringify(entry.photoPaths),
-        stringify(entry.mediaPaths),
+        stringify(toRelativePathArray(entry.photoPaths)),
+        stringify(toRelativePathArray(entry.mediaPaths)),
         stringify(entry.storageUrls),
-        entry.valence ?? null,
-        entry.arousal ?? null,
         stringify(entry.emotionLabels),
         entry.emotionNote ?? null,
         entry.timestamp,
         entry.latitude || null,
         entry.longitude || null,
-        entry.cycleType || null,
         entry.albumId || null,
         entry.journalId || null,
         entry.weather ?? null,
@@ -822,6 +1227,7 @@ export const createEntry = async (entry: Entry): Promise<void> => {
         entry.country?.trim() || null,
         entry.city?.trim() || null,
         stringify(entry.colorPalettes),
+        stringify(toRelativePathArray(entry.thumbPaths ?? [])),
         entry.isDraft ? 1 : 0,
         entry.isAwe ? 1 : 0,
         now,
@@ -866,14 +1272,11 @@ export const getEntries = async (): Promise<Entry[]> => {
       photoPaths: (parse(row.photo_paths) || []).map(resolveMediaPath),
       mediaPaths: (parse(row.media_paths) || []).map(resolveMediaPath),
       storageUrls: parse(row.storage_urls) || [],
-      valence: row.valence !== null ? row.valence : undefined,
-      arousal: row.arousal !== null ? row.arousal : undefined,
       emotionLabels: parse(row.emotion_labels),
       emotionNote: row.emotion_note ?? undefined,
       timestamp: row.timestamp,
       latitude: row.latitude !== null ? row.latitude : undefined,
       longitude: row.longitude !== null ? row.longitude : undefined,
-      cycleType: row.cycle_type || undefined,
       albumId: row.album_id || undefined,
       journalId: row.journal_id || undefined,
       weather: row.weather ?? undefined,
@@ -883,6 +1286,7 @@ export const getEntries = async (): Promise<Entry[]> => {
       country: row.country != null && String(row.country).trim() !== '' ? String(row.country).trim() : undefined,
       city: row.city != null && String(row.city).trim() !== '' ? String(row.city).trim() : undefined,
       colorPalettes: parse(row.photo_color_palettes) ?? undefined,
+      thumbPaths: (parse(row.thumb_paths) || []).map(resolveMediaPath).filter(Boolean),
       isDraft: row.is_draft === 1,
       isAwe: row.is_awe === 1,
       createdAt: row.created_at,
@@ -890,6 +1294,21 @@ export const getEntries = async (): Promise<Entry[]> => {
     }));
   } catch (error) {
     logger.error('Error getting entries:', error);
+    return [];
+  }
+};
+
+/** Returns a page of entries by recency. Used for tiered initial load. */
+export const getEntriesPaged = async (limit: number, offset: number = 0): Promise<Entry[]> => {
+  try {
+    const database = await getDatabase();
+    const result = await database.getAllAsync(
+      'SELECT * FROM entries ORDER BY timestamp DESC LIMIT ? OFFSET ?',
+      [limit, offset]
+    );
+    return (result as any[]).map(rowToEntry);
+  } catch (error) {
+    logger.error('Error getting paged entries:', error);
     return [];
   }
 };
@@ -903,14 +1322,11 @@ const rowToEntry = (row: any): Entry => ({
   photoPaths: (parse(row.photo_paths) || []).map(resolveMediaPath),
   mediaPaths: (parse(row.media_paths) || []).map(resolveMediaPath),
   storageUrls: parse(row.storage_urls) || [],
-  valence: row.valence !== null ? row.valence : undefined,
-  arousal: row.arousal !== null ? row.arousal : undefined,
   emotionLabels: parse(row.emotion_labels),
   emotionNote: row.emotion_note ?? undefined,
   timestamp: row.timestamp,
   latitude: row.latitude !== null ? row.latitude : undefined,
   longitude: row.longitude !== null ? row.longitude : undefined,
-  cycleType: row.cycle_type || undefined,
   albumId: row.album_id || undefined,
   journalId: row.journal_id || undefined,
   weather: row.weather ?? undefined,
@@ -920,6 +1336,7 @@ const rowToEntry = (row: any): Entry => ({
   country: row.country != null && String(row.country).trim() !== '' ? String(row.country).trim() : undefined,
   city: row.city != null && String(row.city).trim() !== '' ? String(row.city).trim() : undefined,
   colorPalettes: parse(row.photo_color_palettes) ?? undefined,
+  thumbPaths: (parse(row.thumb_paths) || []).map(resolveMediaPath).filter(Boolean),
   isDraft: row.is_draft === 1,
   isAwe: row.is_awe === 1,
   createdAt: row.created_at,
@@ -1026,17 +1443,14 @@ export const getEntryById = async (id: string): Promise<Entry | null> => {
       title: row.title || undefined,
       description: row.description,
       mediaType: row.media_type,
-      photoPaths: parse(row.photo_paths) || [],
-      mediaPaths: parse(row.media_paths) || [],
+      photoPaths: (parse(row.photo_paths) || []).map(resolveMediaPath),
+      mediaPaths: (parse(row.media_paths) || []).map(resolveMediaPath),
       storageUrls: parse(row.storage_urls) || [],
-      valence: row.valence !== null ? row.valence : undefined,
-      arousal: row.arousal !== null ? row.arousal : undefined,
       emotionLabels: parse(row.emotion_labels),
       emotionNote: row.emotion_note ?? undefined,
       timestamp: row.timestamp,
       latitude: row.latitude !== null ? row.latitude : undefined,
       longitude: row.longitude !== null ? row.longitude : undefined,
-      cycleType: row.cycle_type || undefined,
       albumId: row.album_id || undefined,
       journalId: row.journal_id || undefined,
       weather: row.weather ?? undefined,
@@ -1065,27 +1479,24 @@ export const updateEntry = async (entry: Entry): Promise<void> => {
     await database.runAsync(
       `UPDATE entries SET
         type = ?, title = ?, description = ?, media_type = ?, photo_paths = ?,
-        media_paths = ?, storage_urls = ?, valence = ?, arousal = ?, emotion_labels = ?, emotion_note = ?,
-        timestamp = ?, latitude = ?, longitude = ?, cycle_type = ?, album_id = ?,
+        media_paths = ?, storage_urls = ?, emotion_labels = ?, emotion_note = ?,
+        timestamp = ?, latitude = ?, longitude = ?, album_id = ?,
         journal_id = ?, weather = ?, temperature_celsius = ?, altitude_meters = ?, season = ?, country = ?, city = ?,
-        photo_color_palettes = ?, is_draft = ?, is_awe = ?, updated_at = ?
+        photo_color_palettes = ?, thumb_paths = ?, is_draft = ?, is_awe = ?, updated_at = ?
       WHERE id = ?`,
       [
         entry.type,
         entry.title || null,
         entry.description,
         entry.mediaType,
-        stringify(entry.photoPaths),
-        stringify(entry.mediaPaths),
+        stringify(toRelativePathArray(entry.photoPaths)),
+        stringify(toRelativePathArray(entry.mediaPaths)),
         stringify(entry.storageUrls),
-        entry.valence ?? null,
-        entry.arousal ?? null,
         stringify(entry.emotionLabels),
         entry.emotionNote ?? null,
         entry.timestamp,
         entry.latitude || null,
         entry.longitude || null,
-        entry.cycleType || null,
         entry.albumId || null,
         entry.journalId || null,
         entry.weather ?? null,
@@ -1095,6 +1506,7 @@ export const updateEntry = async (entry: Entry): Promise<void> => {
         entry.country?.trim() || null,
         entry.city?.trim() || null,
         stringify(entry.colorPalettes),
+        stringify(toRelativePathArray(entry.thumbPaths ?? [])),
         entry.isDraft ? 1 : 0,
         entry.isAwe ? 1 : 0,
         now,
@@ -1118,6 +1530,96 @@ export const deleteEntry = async (id: string): Promise<void> => {
   }
 };
 
+/** Updates only weather data for one entry. Never reads or writes photo paths. */
+export const updateEntryWeather = async (
+  id: string,
+  weather: string,
+  temperatureCelsius: number | null
+): Promise<void> => {
+  try {
+    const database = await getDatabase();
+    await database.runAsync(
+      'UPDATE entries SET weather = ?, temperature_celsius = ?, updated_at = ? WHERE id = ?',
+      [weather, temperatureCelsius ?? null, new Date().toISOString(), id]
+    );
+  } catch (error) {
+    logger.error('Error updating entry weather:', error);
+    throw error;
+  }
+};
+
+/** Updates only country/city for one entry. Never reads or writes photo paths. */
+export const updateEntryLocationText = async (
+  id: string,
+  country: string | null,
+  city: string | null
+): Promise<void> => {
+  try {
+    const database = await getDatabase();
+    await database.runAsync(
+      'UPDATE entries SET country = ?, city = ?, updated_at = ? WHERE id = ?',
+      [country?.trim() ?? null, city?.trim() ?? null, new Date().toISOString(), id]
+    );
+  } catch (error) {
+    logger.error('Error updating entry location text:', error);
+    throw error;
+  }
+};
+
+/** Updates only color palettes for one entry. Never reads or writes photo paths. */
+export const updateEntryColorPalettes = async (
+  id: string,
+  colorPalettes: string[][]
+): Promise<void> => {
+  try {
+    const database = await getDatabase();
+    await database.runAsync(
+      'UPDATE entries SET photo_color_palettes = ?, updated_at = ? WHERE id = ?',
+      [stringify(colorPalettes), new Date().toISOString(), id]
+    );
+  } catch (error) {
+    logger.error('Error updating entry color palettes:', error);
+    throw error;
+  }
+};
+
+/** Photo entries that have no thumbnail paths yet. Used by the thumbnail backfill service. */
+export const getEntriesMissingThumbs = async (limit = 10): Promise<Entry[]> => {
+  try {
+    const database = await getDatabase();
+    const result = await database.getAllAsync(
+      `SELECT * FROM entries
+       WHERE (
+         thumb_paths IS NULL OR thumb_paths = '' OR thumb_paths = '[]'
+         OR (thumb_paths NOT LIKE '%_thumb2.jpg%')
+       )
+       AND photo_paths IS NOT NULL AND photo_paths != '' AND photo_paths != '[]'
+       AND media_type = 'photo' AND is_draft = 0
+       ORDER BY timestamp DESC
+       LIMIT ?`,
+      [limit]
+    );
+    return (result as any[]).map(rowToEntry);
+  } catch (error) {
+    logger.error('Error getting entries missing thumbs:', error);
+    return [];
+  }
+};
+
+/** Updates only thumb_paths for one entry. Used by thumbnail backfill and capture flow. */
+export const updateEntryThumbPaths = async (id: string, thumbPaths: string[]): Promise<void> => {
+  try {
+    const database = await getDatabase();
+    await database.runAsync(
+      'UPDATE entries SET thumb_paths = ?, updated_at = ? WHERE id = ?',
+      [stringify(toRelativePathArray(thumbPaths)), new Date().toISOString(), id]
+    );
+  } catch (error) {
+    logger.error('Error updating entry thumb paths:', error);
+    throw error;
+  }
+};
+
 // Journal Operations
 export const createJournal = async (journal: Journal): Promise<void> => {
   try {
@@ -1126,20 +1628,21 @@ export const createJournal = async (journal: Journal): Promise<void> => {
     
     await database.runAsync(
       `INSERT INTO journals (
-        id, title, content, timestamp, cycle_type, linked_entry_id,
-        emotion_responses, ai_prompts, latitude, longitude, album_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        id, title, content, timestamp, linked_entry_id,
+        emotion_responses, ai_prompts, latitude, longitude, country, city, album_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         journal.id,
         journal.title || null,
         journal.content,
         journal.timestamp,
-        journal.cycleType,
         journal.linkedEntryId || null,
         stringify(journal.emotionResponses),
         stringify(journal.aiPrompts),
         journal.latitude || null,
         journal.longitude || null,
+        journal.country?.trim() || null,
+        journal.city?.trim() || null,
         journal.albumId || null,
         now,
         now,
@@ -1161,12 +1664,13 @@ export const getJournals = async (): Promise<Journal[]> => {
       title: row.title || undefined,
       content: row.content,
       timestamp: row.timestamp,
-      cycleType: row.cycle_type,
       linkedEntryId: row.linked_entry_id || undefined,
       emotionResponses: parse(row.emotion_responses),
       aiPrompts: parse(row.ai_prompts),
       latitude: row.latitude !== null ? row.latitude : undefined,
       longitude: row.longitude !== null ? row.longitude : undefined,
+      country: row.country != null && String(row.country).trim() !== '' ? String(row.country).trim() : undefined,
+      city: row.city != null && String(row.city).trim() !== '' ? String(row.city).trim() : undefined,
       albumId: row.album_id || undefined,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -1190,12 +1694,13 @@ export const getJournalById = async (id: string): Promise<Journal | null> => {
       title: row.title || undefined,
       content: row.content,
       timestamp: row.timestamp,
-      cycleType: row.cycle_type,
       linkedEntryId: row.linked_entry_id || undefined,
       emotionResponses: parse(row.emotion_responses),
       aiPrompts: parse(row.ai_prompts),
       latitude: row.latitude !== null ? row.latitude : undefined,
       longitude: row.longitude !== null ? row.longitude : undefined,
+      country: row.country != null && String(row.country).trim() !== '' ? String(row.country).trim() : undefined,
+      city: row.city != null && String(row.city).trim() !== '' ? String(row.city).trim() : undefined,
       albumId: row.album_id || undefined,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -1206,6 +1711,44 @@ export const getJournalById = async (id: string): Promise<Journal | null> => {
   }
 };
 
+/** Journals with coords but missing either persisted country or city/locality text. */
+export const getJournalsMissingLocationText = async (limit = 40): Promise<Journal[]> => {
+  try {
+    const database = await getDatabase();
+    const result = await database.getAllAsync(
+      `SELECT * FROM journals
+       WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+         AND (
+           country IS NULL OR country = '' OR
+           city IS NULL OR city = ''
+         )
+       ORDER BY timestamp DESC
+       LIMIT ?`,
+      [limit]
+    );
+
+    return (result as any[]).map((row) => ({
+      id: row.id,
+      title: row.title || undefined,
+      content: row.content,
+      timestamp: row.timestamp,
+      linkedEntryId: row.linked_entry_id || undefined,
+      emotionResponses: parse(row.emotion_responses),
+      aiPrompts: parse(row.ai_prompts),
+      latitude: row.latitude !== null ? row.latitude : undefined,
+      longitude: row.longitude !== null ? row.longitude : undefined,
+      country: row.country != null && String(row.country).trim() !== '' ? String(row.country).trim() : undefined,
+      city: row.city != null && String(row.city).trim() !== '' ? String(row.city).trim() : undefined,
+      albumId: row.album_id || undefined,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  } catch (error) {
+    logger.error('Error getting journals missing location text:', error);
+    return [];
+  }
+};
+
 export const updateJournal = async (journal: Journal): Promise<void> => {
   try {
     const database = await getDatabase();
@@ -1213,20 +1756,21 @@ export const updateJournal = async (journal: Journal): Promise<void> => {
     
     await database.runAsync(
       `UPDATE journals SET
-        title = ?, content = ?, timestamp = ?, cycle_type = ?, linked_entry_id = ?,
-        emotion_responses = ?, ai_prompts = ?, latitude = ?, longitude = ?,
+        title = ?, content = ?, timestamp = ?, linked_entry_id = ?,
+        emotion_responses = ?, ai_prompts = ?, latitude = ?, longitude = ?, country = ?, city = ?,
         album_id = ?, updated_at = ?
       WHERE id = ?`,
       [
         journal.title || null,
         journal.content,
         journal.timestamp,
-        journal.cycleType,
         journal.linkedEntryId || null,
         stringify(journal.emotionResponses),
         stringify(journal.aiPrompts),
         journal.latitude || null,
         journal.longitude || null,
+        journal.country?.trim() || null,
+        journal.city?.trim() || null,
         journal.albumId || null,
         now,
         journal.id,
@@ -1279,6 +1823,132 @@ export const getActiveTripAlbums = async (): Promise<TripAlbum[]> => {
 };
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Postcards
+// ---------------------------------------------------------------------------
+
+const parsePostcardPhotoTransform = (raw: string | null | undefined): PostcardPhotoTransform | undefined => {
+  if (raw == null || raw === '') return undefined;
+  const obj = parse(raw);
+  if (!obj || typeof obj !== 'object') return undefined;
+  const o = obj as Record<string, unknown>;
+  const scale = typeof o.scale === 'number' && Number.isFinite(o.scale) ? o.scale : 1;
+  const translateX = typeof o.translateX === 'number' && Number.isFinite(o.translateX) ? o.translateX : 0;
+  const translateY = typeof o.translateY === 'number' && Number.isFinite(o.translateY) ? o.translateY : 0;
+  return { scale, translateX, translateY };
+};
+
+export const createPostcard = async (postcard: Postcard): Promise<void> => {
+  try {
+    const database = await getDatabase();
+    await database.runAsync(
+      `INSERT INTO postcards (id, created_at, updated_at, template_id, aspect_ratio,
+        top_photo_path, bottom_photo_path, top_label, bottom_label, downloaded,
+        top_photo_transform, bottom_photo_transform,
+        photo3_path, photo3_transform, photo4_path, photo4_transform, template_data)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        postcard.id,
+        postcard.createdAt,
+        postcard.updatedAt,
+        postcard.templateId,
+        postcard.aspectRatio,
+        postcard.topPhotoPath ?? null,
+        postcard.bottomPhotoPath ?? null,
+        postcard.topLabel,
+        postcard.bottomLabel,
+        postcard.downloaded ? 1 : 0,
+        postcard.topPhotoTransform != null ? stringify(postcard.topPhotoTransform) : null,
+        postcard.bottomPhotoTransform != null ? stringify(postcard.bottomPhotoTransform) : null,
+        postcard.photo3Path ?? null,
+        postcard.photo3Transform != null ? stringify(postcard.photo3Transform) : null,
+        postcard.photo4Path ?? null,
+        postcard.photo4Transform != null ? stringify(postcard.photo4Transform) : null,
+        postcard.templateData != null ? stringify(postcard.templateData) : null,
+      ]
+    );
+  } catch (error) {
+    logger.error('Error creating postcard:', error);
+    throw error;
+  }
+};
+
+export const updatePostcard = async (postcard: Postcard): Promise<void> => {
+  try {
+    const database = await getDatabase();
+    await database.runAsync(
+      `UPDATE postcards SET updated_at = ?, template_id = ?, aspect_ratio = ?,
+        top_photo_path = ?, bottom_photo_path = ?, top_label = ?, bottom_label = ?,
+        downloaded = ?, top_photo_transform = ?, bottom_photo_transform = ?,
+        photo3_path = ?, photo3_transform = ?, photo4_path = ?, photo4_transform = ?,
+        template_data = ?
+       WHERE id = ?`,
+      [
+        postcard.updatedAt,
+        postcard.templateId,
+        postcard.aspectRatio,
+        postcard.topPhotoPath ?? null,
+        postcard.bottomPhotoPath ?? null,
+        postcard.topLabel,
+        postcard.bottomLabel,
+        postcard.downloaded ? 1 : 0,
+        postcard.topPhotoTransform != null ? stringify(postcard.topPhotoTransform) : null,
+        postcard.bottomPhotoTransform != null ? stringify(postcard.bottomPhotoTransform) : null,
+        postcard.photo3Path ?? null,
+        postcard.photo3Transform != null ? stringify(postcard.photo3Transform) : null,
+        postcard.photo4Path ?? null,
+        postcard.photo4Transform != null ? stringify(postcard.photo4Transform) : null,
+        postcard.templateData != null ? stringify(postcard.templateData) : null,
+        postcard.id,
+      ]
+    );
+  } catch (error) {
+    logger.error('Error updating postcard:', error);
+    throw error;
+  }
+};
+
+export const getPostcards = async (): Promise<Postcard[]> => {
+  try {
+    const database = await getDatabase();
+    const rows = await database.getAllAsync(
+      'SELECT * FROM postcards ORDER BY updated_at DESC'
+    );
+    return (rows as any[]).map((row) => ({
+      id: row.id,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      templateId: row.template_id,
+      aspectRatio: row.aspect_ratio as Postcard['aspectRatio'],
+      topPhotoPath: row.top_photo_path ?? null,
+      bottomPhotoPath: row.bottom_photo_path ?? null,
+      topLabel: row.top_label ?? '',
+      bottomLabel: row.bottom_label ?? '',
+      downloaded: row.downloaded === 1,
+      topPhotoTransform: parsePostcardPhotoTransform(row.top_photo_transform),
+      bottomPhotoTransform: parsePostcardPhotoTransform(row.bottom_photo_transform),
+      photo3Path: row.photo3_path ?? null,
+      photo3Transform: parsePostcardPhotoTransform(row.photo3_transform),
+      photo4Path: row.photo4_path ?? null,
+      photo4Transform: parsePostcardPhotoTransform(row.photo4_transform),
+      templateData: row.template_data != null ? (parse(row.template_data) as Record<string, unknown> | null) : null,
+    }));
+  } catch (error) {
+    logger.error('Error fetching postcards:', error);
+    return [];
+  }
+};
+
+export const deletePostcard = async (id: string): Promise<void> => {
+  try {
+    const database = await getDatabase();
+    await database.runAsync('DELETE FROM postcards WHERE id = ?', [id]);
+  } catch (error) {
+    logger.error('Error deleting postcard:', error);
+    throw error;
+  }
+};
+
 // Travel Mode — AsyncStorage helpers
 // ---------------------------------------------------------------------------
 

@@ -3,34 +3,33 @@
 // Also runs once on mount if already online (e.g. app reopened while connected).
 
 import { useEffect, useRef } from 'react';
-import { Entry } from '../models/Entry';
 import { runMetadataBackfill } from '../services/MetadataBackfillService';
 
 const DEBOUNCE_MS = 3000;
 const INITIAL_RUN_DELAY_MS = 2000;
 
-export type UpdateEntryFn = (entry: Entry) => Promise<void>;
-
 /**
  * When connectivity becomes available, runs metadata backfill (weather for entries missing it).
+ * Calls onDone() once after each successful batch so callers can refresh state.
  * Debounces "back online" events and avoids overlapping runs. Cleanup on unmount.
  */
-export function useMetadataBackfillWhenOnline(updateEntry: UpdateEntryFn): void {
+export function useMetadataBackfillWhenOnline(onDone?: () => void): void {
   const wasConnectedRef = useRef<boolean | null>(null);
   const inProgressRef = useRef(false);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const updateEntryRef = useRef(updateEntry);
-  updateEntryRef.current = updateEntry;
+  const onDoneRef = useRef(onDone);
+  onDoneRef.current = onDone;
 
   const runBackfill = () => {
     if (inProgressRef.current) return;
     inProgressRef.current = true;
-    runMetadataBackfill(updateEntryRef.current)
+    runMetadataBackfill()
       .catch(() => {
         // runMetadataBackfill never throws; ignore
       })
       .finally(() => {
         inProgressRef.current = false;
+        onDoneRef.current?.();
       });
   };
 

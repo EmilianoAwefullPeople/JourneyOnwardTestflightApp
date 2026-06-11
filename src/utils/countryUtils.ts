@@ -148,6 +148,11 @@ function resolveIsoForCountryName(trimmed: string): string | undefined {
   return key ? COUNTRY_NAME_TO_ISO[key] : undefined;
 }
 
+export function getIsoCodeForCountryName(name: string): string | null {
+  if (!name || typeof name !== 'string') return null;
+  return resolveIsoForCountryName(name.trim()) ?? null;
+}
+
 export function getKnownCountryNames(): string[] {
   // Collapse aliases that point to the same ISO code (e.g. "Laos" vs "Lao People's Democratic Republic").
   // Keep the first encountered key as the display name; the map is ordered with common names first.

@@ -31,6 +31,29 @@ export function resolveMediaPath(storedPath: string): string {
 }
 
 /**
+ * Converts an absolute persistent-media file:// URI back to its relative form
+ * (e.g. "media/uuid_0.jpg"). No-ops on already-relative paths, ph://, http(s)://,
+ * or any path not under Documents/media/. Safe to call on already-relative paths.
+ */
+export function toRelativePath(p: string): string {
+  if (!p || !p.startsWith('file://')) return p;
+  try {
+    const mediaDir = new Directory(Paths.document, MEDIA_DIR_NAME);
+    const root = mediaDir.uri.endsWith('/') ? mediaDir.uri : `${mediaDir.uri}/`;
+    if (p.startsWith(root)) {
+      return `${MEDIA_DIR_NAME}/${p.slice(root.length)}`;
+    }
+  } catch {
+    // File-system API unavailable — return original path unchanged
+  }
+  return p;
+}
+
+export function toRelativePathArray(paths: string[]): string[] {
+  return paths.map(toRelativePath);
+}
+
+/**
  * Ensures the persistent media directory exists (documentDirectory/media/).
  * Idempotent; safe to call multiple times.
  */
@@ -161,4 +184,60 @@ export function deletePersistentMediaForEntry(entryId: string): void {
   } catch (e) {
     logger.warn('mediaStorage: deletePersistentMediaForEntry failed', { entryId, e });
   }
+}
+
+/**
+ * Generates 600 px-wide JPEG thumbnails for each resolved photo URI and saves them
+ * into the same persistent media directory as `{entryId}_{index}_thumb2.jpg`.
+ *
+ * Skips photos whose thumbnail already exists on disk. Returns an array of relative
+ * paths in the same slot order as resolvedPhotoPaths; empty strings for any slot
+ * that failed so callers can safely fall back to photoPaths[i].
+ *
+ * @param resolvedPhotoPaths - Fully-qualified file:// URIs (already resolved from DB).
+ * @param entryId - Entry UUID used to name the thumbnail files.
+ */
+export async function generateAndSaveThumbnails(
+  resolvedPhotoPaths: string[],
+  entryId: string,
+): Promise<string[]> {
+  if (resolvedPhotoPaths.length === 0) return [];
+
+  // Dynamic import so expo-image-manipulator isn't in the initial module chain.
+  const { manipulateAsync, SaveFormat } = await import('expo-image-manipulator');
+
+  ensureMediaDirectory();
+  const mediaDir = new Directory(Paths.document, MEDIA_DIR_NAME);
+  const result: string[] = [];
+
+  for (let i = 0; i < resolvedPhotoPaths.length; i++) {
+    const sourcePath = resolvedPhotoPaths[i];
+    if (!sourcePath) { result.push(''); continue; }
+
+    const thumbFileName = `${entryId}_${i}_thumb2.jpg`;
+    const thumbRelativePath = `${MEDIA_DIR_NAME}/${thumbFileName}`;
+    const thumbFile = new File(mediaDir, thumbFileName);
+
+    if (thumbFile.exists) {
+      result.push(thumbRelativePath);
+      continue;
+    }
+
+    try {
+      const thumb = await manipulateAsync(
+        sourcePath,
+        [{ resize: { width: 600 } }],
+        { compress: 0.82, format: SaveFormat.JPEG },
+      );
+      // Copy from manipulator's temp output to persistent media directory.
+      const tempFile = new File(thumb.uri);
+      tempFile.copy(thumbFile);
+      result.push(thumbRelativePath);
+    } catch (e) {
+      logger.warn('mediaStorage: thumbnail generation failed', { entryId, index: i, error: e });
+      result.push('');
+    }
+  }
+
+  return result;
 }

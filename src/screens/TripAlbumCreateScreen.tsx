@@ -22,7 +22,6 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import { RootStackParamList } from '../navigation/types';
 import { useAppContext } from '../context/AppContext';
-import { useProgress } from '../context/ProgressContext';
 import { COLORS, DIMENSIONS, FONTS, FONT_WEIGHTS, SPACING } from '../config/constants';
 import { logger } from '../utils/logger';
 import { useTheme } from '../context/ThemeContext';
@@ -42,7 +41,6 @@ const TripAlbumCreateScreen: React.FC = () => {
   const insets = useSafeAreaInsets();
   const { colors, isDark } = useTheme();
   const { createTripAlbum, updateTripAlbum, tripAlbums } = useAppContext();
-  const { record } = useProgress();
 
   const albumId = (route.params as { albumId?: string } | undefined)?.albumId;
   const isEditMode = Boolean(albumId);
@@ -150,11 +148,6 @@ const TripAlbumCreateScreen: React.FC = () => {
         navigation.goBack();
       } else {
         await createTripAlbum(album);
-        try {
-          record('trip_album_created');
-        } catch (_) {
-          // Non-blocking; progress save failure is logged in context
-        }
         navigation.dispatch(
           CommonActions.reset({
             index: 0,
@@ -162,9 +155,8 @@ const TripAlbumCreateScreen: React.FC = () => {
               {
                 name: 'MainTabs',
                 state: {
-                  index: 2,
+                  index: 1,
                   routes: [
-                    { name: 'Studio' },
                     { name: 'Home' },
                     { name: 'Review', params: { initialSection: 'tripAlbums' } },
                   ],

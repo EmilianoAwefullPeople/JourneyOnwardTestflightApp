@@ -9,7 +9,6 @@ import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation/types';
 import { useAppContext } from '../context/AppContext';
-import { useProgress } from '../context/ProgressContext';
 import { COLORS, SPACING, FONTS, FONT_WEIGHTS } from '../config/constants';
 import { TEXT_STYLES } from '../config/typography';
 import { useTheme } from '../context/ThemeContext';
@@ -20,6 +19,7 @@ import TripAlbumSegmentControl from '../components/review/TripAlbumSegmentContro
 import AllSection from '../components/review/AllSection';
 import MapViewSection from '../components/review/MapViewSection';
 import DashboardSection from '../components/review/DashboardSection';
+import { Ionicons } from '@expo/vector-icons';
 
 type TripAlbumDetailScreenNavigationProp = NativeStackNavigationProp<RootStackParamList, 'TripAlbumDetail'>;
 type TripAlbumDetailScreenRouteProp = RouteProp<RootStackParamList, 'TripAlbumDetail'>;
@@ -31,7 +31,6 @@ const TripAlbumDetailScreen: React.FC = () => {
   const insets = useSafeAreaInsets();
   const { albumId } = route.params;
   const { tripAlbums, entries, journals, deleteTripAlbum } = useAppContext();
-  const { recordTripAlbumSection } = useProgress();
 
   const [activeSection, setActiveSection] = useState<'all' | 'dashboard' | 'map'>('all');
   const [showGalleryBookmarksOnly, setShowGalleryBookmarksOnly] = useState(false);
@@ -46,16 +45,6 @@ const TripAlbumDetailScreen: React.FC = () => {
   const reduceMotion = useReduceMotion();
   const sectionOpacity = useRef(new Animated.Value(1)).current;
   const sectionTranslateY = useRef(new Animated.Value(0)).current;
-
-  useEffect(() => {
-    if (activeSection === 'all' || activeSection === 'dashboard' || activeSection === 'map') {
-      try {
-        recordTripAlbumSection(albumId, activeSection);
-      } catch (_) {
-        // Non-blocking
-      }
-    }
-  }, [activeSection, albumId, recordTripAlbumSection]);
 
   useEffect(() => {
     activeSectionRef.current = activeSection;
@@ -123,7 +112,7 @@ const TripAlbumDetailScreen: React.FC = () => {
           shadowRadius: 4,
           elevation: 8,
         },
-        menuOption: { paddingVertical: 12, paddingHorizontal: 16 },
+        menuOption: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 16, gap: 10 },
         menuOptionText: { fontFamily: FONTS.inter, fontSize: 16, color: colors.textPrimary },
         menuOptionTextDanger: { color: '#DC2626' },
         headerContent: { flex: 1 },
@@ -184,6 +173,10 @@ const TripAlbumDetailScreen: React.FC = () => {
 
   const handleJournalPress = (journal: any) => {
     navigation.navigate('JournalDetail', { journalId: journal.id });
+  };
+
+  const handleRecapPress = () => {
+    navigation.navigate('JourneyRecapPlayer', { albumId });
   };
 
   const scrollActiveSectionToTop = () => {
@@ -381,9 +374,11 @@ const TripAlbumDetailScreen: React.FC = () => {
           </TouchableWithoutFeedback>
           <Animated.View style={[styles.menuDropdown, { top: topBarTop + 40, right: 25 * scaleFactor, transform: [{ scale: menuDropdownScale }] }]} pointerEvents="box-none">
             <TouchableOpacity style={styles.menuOption} onPress={handleEdit} accessibilityRole="button" accessibilityLabel="Edit album" activeOpacity={0.7}>
+              <Ionicons name="settings" size={20} color={colors.textPrimary} />
               <Text style={styles.menuOptionText}>Edit</Text>
             </TouchableOpacity>
             <TouchableOpacity style={styles.menuOption} onPress={handleDelete} accessibilityRole="button" accessibilityLabel="Delete album" activeOpacity={0.7}>
+              <Ionicons name="trash-outline" size={20} color="#DC2626" />
               <Text style={[styles.menuOptionText, styles.menuOptionTextDanger]}>Delete</Text>
             </TouchableOpacity>
           </Animated.View>
@@ -396,6 +391,7 @@ const TripAlbumDetailScreen: React.FC = () => {
           activeSegment={activeSection}
           onSegmentChange={setActiveSection}
           onActiveSegmentPress={scrollActiveSectionToTop}
+          onRecapPress={handleRecapPress}
         />
       </View>
 

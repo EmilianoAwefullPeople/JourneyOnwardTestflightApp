@@ -512,12 +512,12 @@ const EntryDetailScreen: React.FC = () => {
           fontFamily: FONTS.inter,
           fontSize: 26,
           fontWeight: FONT_WEIGHTS.bold,
-          color: '#e4e4e4',
+          color: isDark ? '#e4e4e4' : colors.textPrimary,
         },
         dataGridLabel: {
           fontFamily: FONTS.inter,
           fontSize: 12,
-          color: '#707070',
+          color: isDark ? '#707070' : colors.textSecondary,
           marginTop: 4,
         },
         writeAboutButton: {
@@ -833,7 +833,7 @@ const EntryDetailScreen: React.FC = () => {
                           <Ionicons name="compass-outline" size={15 * scaleFactor} color="white" />
                         </View>
                         <Text
-                          style={[styles.title, { position: 'relative', fontSize: 18 * scaleFactor, flex: 1, backgroundColor: 'transparent', color: 'white' }]}
+                          style={[styles.title, { position: 'relative', fontSize: 10 * scaleFactor, flex: 1, backgroundColor: 'transparent', color: 'white' }]}
                           numberOfLines={2}
                         >
                           {entry.title || '(Untitled)'}

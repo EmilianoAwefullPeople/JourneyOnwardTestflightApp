@@ -6,7 +6,8 @@ import * as MediaLibrary from 'expo-media-library';
 import { logger } from '../utils/logger';
 import { getDecimalCoordinatesFromExif } from '../utils/exifGps';
 import { normalizeExifForMetadata } from '../utils/exifUtils';
-import { getCountryFromCoordinates } from '../utils/dateUtils';
+import { parseExifDateTimeToMs } from '../utils/exifTimestamp';
+import { getIsoCodeForCountryName } from '../utils/countryUtils';
 import {
   importLatestCoordBucketKey,
   readImportGeoCountryCache,
@@ -18,6 +19,7 @@ import {
   selectRepresentativeAssets,
   rankAndCapClusters,
   MAX_SUGGESTED_EXPERIENCES,
+  TIME_WINDOW_MS,
 } from '../utils/importLatestClustering';
 import {
   loadYearAvailabilityCache,
@@ -26,7 +28,7 @@ import {
 } from '../utils/importLatestYearCache';
 
 const HOURS_72_MS = 72 * 60 * 60 * 1000;
-const FETCH_PAGE_SIZE = 200;
+const FETCH_PAGE_SIZE = 500;
 
 /** Thrown when the user leaves the import screen and work should stop. */
 export class ImportLatestAbortedError extends Error {
@@ -50,6 +52,8 @@ const throwIfAborted = (signal: AbortSignal | undefined): void => {
 const ASSET_INFO_CONCURRENCY = 8;
 /** Reverse geocode concurrency (Apple CLGeocoder is sensitive to burst traffic). */
 const GEOCODE_CONCURRENCY = 4;
+/** Concurrent month-range pagination during year-based fetching. */
+const MONTH_FETCH_CONCURRENCY = 4;
 
 async function mapWithConcurrency<T, R>(
   items: T[],
@@ -147,6 +151,21 @@ export interface RunImportLatestOptions {
   signal?: AbortSignal;
 }
 
+// Asset shape returned by expo-image-picker with exif: true
+export interface PickedGalleryAsset {
+  uri: string;
+  width: number;
+  height: number;
+  assetId?: string | null;
+  exif?: Record<string, unknown> | null;
+}
+
+export interface RunImportFromSelectionOptions {
+  onProgress?: (progress: ImportLatestProgress) => void;
+  signal?: AbortSignal;
+  maxSuggestions?: number;
+}
+
 export interface AvailableGalleryYearsOptions {
   cacheTtlMs?: number;
   onProgress?: (completed: number, total: number) => void;
@@ -240,15 +259,6 @@ const getGalleryBounds = async (): Promise<{
   }
 };
 
-const getGallerySignature = async (): Promise<ImportLatestYearAvailabilitySignature> => {
-  const bounds = await getGalleryBounds();
-  return {
-    newestAssetId: bounds.newestAssetId,
-    newestCreationTimeMs: bounds.newestCreationTimeMs ?? undefined,
-    estimatedTotal: bounds.estimatedTotal,
-  };
-};
-
 const signaturesEqual = (
   a?: ImportLatestYearAvailabilitySignature,
   b?: ImportLatestYearAvailabilitySignature
@@ -275,24 +285,6 @@ function normalizeRange(range?: ImportLatestRange): { createdAfter: number; crea
   return { createdAfter, createdBefore };
 }
 
-/** Total photos matching the query (MediaLibrary `totalCount` on first page). */
-async function getPhotoCountForQuery(createdAfter: number, createdBefore: number): Promise<number | null> {
-  try {
-    const page = await MediaLibrary.getAssetsAsync({
-      first: 1,
-      sortBy: [[MediaLibrary.SortBy.creationTime, false]],
-      mediaType: MediaLibrary.MediaType.photo,
-      createdAfter,
-      createdBefore,
-    });
-    const tc = (page as { totalCount?: number }).totalCount;
-    if (typeof tc === 'number' && tc >= 0) return tc;
-    return null;
-  } catch (error) {
-    logger.warn('ImportLatest: getPhotoCountForQuery failed', error);
-    return null;
-  }
-}
 
 /**
  * Fetch photo assets for a creation-time range and map to MediaAsset[].
@@ -439,8 +431,13 @@ export async function getAvailableGalleryYears(
 ): Promise<number[]> {
   const ttl = options?.cacheTtlMs ?? YEAR_AVAILABILITY_CACHE_TTL_MS;
   const now = Date.now();
-  const cached = await loadYearAvailabilityCache();
-  const currentSignature = await getGallerySignature();
+  // Load cache and gallery bounds in parallel — AsyncStorage + MediaLibrary are independent.
+  const [cached, bounds] = await Promise.all([loadYearAvailabilityCache(), getGalleryBounds()]);
+  const currentSignature: ImportLatestYearAvailabilitySignature = {
+    newestAssetId: bounds.newestAssetId,
+    newestCreationTimeMs: bounds.newestCreationTimeMs ?? undefined,
+    estimatedTotal: bounds.estimatedTotal,
+  };
   if (
     cached &&
     now - cached.computedAt <= ttl &&
@@ -449,7 +446,6 @@ export async function getAvailableGalleryYears(
     return cached.years;
   }
 
-  const bounds = await getGalleryBounds();
   if (bounds.oldestCreationTimeMs == null || bounds.newestCreationTimeMs == null) {
     await saveYearAvailabilityCache({
       version: 1,
@@ -482,6 +478,20 @@ export async function getAvailableGalleryYears(
   return years;
 }
 
+/** Decompose selected years into individual calendar-month ranges for parallel fetching. */
+function getMonthRangesForYears(years: number[]): ImportLatestRange[] {
+  const ranges: ImportLatestRange[] = [];
+  for (const year of years) {
+    for (let month = 0; month < 12; month++) {
+      const createdAfter = new Date(year, month, 1, 0, 0, 0, 0).getTime();
+      // new Date(year, month+1, 0) = last calendar day of `month` (day-0 of next month)
+      const createdBefore = new Date(year, month + 1, 0, 23, 59, 59, 999).getTime();
+      ranges.push({ createdAfter, createdBefore });
+    }
+  }
+  return ranges;
+}
+
 async function fetchAssetsForYears(
   years: number[],
   onProgress?: RunImportLatestOptions['onProgress'],
@@ -492,82 +502,78 @@ async function fetchAssetsForYears(
     .sort((a, b) => a - b);
   if (uniqueYears.length === 0) return [];
 
-  const deduped = new Map<string, MediaAsset>();
-  const totalYears = uniqueYears.length;
+  const monthRanges = getMonthRangesForYears(uniqueYears);
 
-  const normalizedRanges = uniqueYears
-    .map((y) => normalizeRange(getYearRangeMs(y)))
-    .filter((r): r is { createdAfter: number; createdBefore: number } => r != null);
-  throwIfAborted(signal);
-  const yearTotals = await Promise.all(
-    normalizedRanges.map((r) => getPhotoCountForQuery(r.createdAfter, r.createdBefore))
+  // Shared progress accumulators. Mutation is safe — JS event loop is single-threaded
+  // so concurrent async callbacks never truly interleave within a synchronous statement.
+  let globalFetched = 0;
+  let globalTotal: number | null = null;
+  // Per-month totals (filled once a month's first page lands) and previous cumulative counts
+  // (used to convert fetchAssetsInRange's cumulative progress into per-page deltas).
+  const monthTotals: (number | null)[] = new Array(monthRanges.length).fill(null);
+  const monthPrev: number[] = new Array(monthRanges.length).fill(0);
+
+  const emitGlobal = () => {
+    onProgress?.({
+      phase: 'fetch',
+      completed: globalFetched,
+      total: globalTotal ?? 0,
+      percent:
+        globalTotal != null && globalTotal > 0
+          ? Math.min(40, (globalFetched / globalTotal) * 40)
+          : 0,
+      label:
+        globalTotal != null
+          ? `Scanning photos (${globalFetched} / ${globalTotal})`
+          : `Scanning photos (${globalFetched})`,
+    });
+  };
+
+  const allMonthAssets = await mapWithConcurrency(
+    monthRanges,
+    MONTH_FETCH_CONCURRENCY,
+    async (monthRange, idx) =>
+      fetchAssetsInRange(
+        monthRange,
+        (progress) => {
+          // fetchAssetsInRange emits cumulative counts; take the delta since the last callback.
+          const delta = progress.completed - monthPrev[idx];
+          monthPrev[idx] = progress.completed;
+          globalFetched += delta;
+
+          // Register this month's expected total the first time it's known.
+          if (progress.total > 0 && monthTotals[idx] == null) {
+            monthTotals[idx] = progress.total;
+          }
+          // Sum of all known month totals; grows as months' first pages arrive.
+          const knownSum = monthTotals.reduce<number>((s, t) => s + (t ?? 0), 0);
+          if (knownSum > 0 && (globalTotal == null || knownSum > globalTotal)) {
+            globalTotal = knownSum;
+          }
+          // Keep denominator ≥ numerator when any month underreports its total.
+          if (globalTotal != null && globalFetched > globalTotal) {
+            globalTotal = globalFetched;
+          }
+
+          emitGlobal();
+        },
+        signal
+      ),
+    signal
   );
-  throwIfAborted(signal);
-  let grandTotal = (() => {
-    let sum = 0;
-    for (const t of yearTotals) {
-      if (typeof t !== 'number' || t < 0) return null;
-      sum += t;
-    }
-    return sum;
-  })();
 
-  let cumulativeFetched = 0;
-
-  for (let i = 0; i < totalYears; i++) {
-    throwIfAborted(signal);
-    const year = uniqueYears[i];
-    const range = getYearRangeMs(year);
-    const assets = await fetchAssetsInRange(range, (progress) => {
-      const globalDone = cumulativeFetched + progress.completed;
-      if (grandTotal != null && grandTotal > 0) {
-        if (globalDone > grandTotal) {
-          // Prefetched yearly totals can undercount; keep denominator monotonic.
-          grandTotal = globalDone;
-        }
-        onProgress?.({
-          phase: 'fetch',
-          completed: globalDone,
-          total: grandTotal,
-          percent: Math.min(40, (globalDone / grandTotal) * 40),
-          label: `Scanning year ${year}`,
-        });
-        return;
-      }
-      const segmentStart = (i / totalYears) * 40;
-      const segmentSpan = 40 / totalYears;
-      const globalPercent = Math.min(
-        40,
-        segmentStart + (Math.min(40, progress.percent) / 40) * segmentSpan
-      );
-      onProgress?.({
-        phase: 'fetch',
-        completed: globalDone,
-        total: grandTotal ?? 0,
-        percent: globalPercent,
-        label: `Scanning year ${year}`,
-      });
-    }, signal);
-    cumulativeFetched += assets.length;
-    for (const asset of assets) {
-      if (!deduped.has(asset.id)) {
-        deduped.set(asset.id, asset);
-      }
-    }
-  }
-  return Array.from(deduped.values());
+  return allMonthAssets.flat();
 }
 
 async function enrichAndFilterAssetsByCountry(
   assets: MediaAsset[],
-  targetCountryName: string,
+  targetIso: string,
   onProgress?: RunImportLatestOptions['onProgress'],
   signal?: AbortSignal
 ): Promise<{ filtered: MediaAsset[]; assetInfoById: Map<string, GalleryResolvedAssetInfo> }> {
-  const normalizedTarget = targetCountryName.trim().toLowerCase();
   const assetInfoById = new Map<string, GalleryResolvedAssetInfo>();
 
-  if (!normalizedTarget) {
+  if (!targetIso) {
     return { filtered: assets, assetInfoById };
   }
 
@@ -601,7 +607,7 @@ async function enrichAndFilterAssetsByCountry(
         longitude: null,
       };
       try {
-        const info = await MediaLibrary.getAssetInfoAsync(asset.id);
+        const info = await MediaLibrary.getAssetInfoAsync(asset.id, { shouldDownloadFromNetwork: false });
         resolved = parseLocationFromMediaAssetInfo(info);
       } catch (err) {
         logger.warn('ImportLatest: getAssetInfoAsync failed during country filter', { id: asset.id, err });
@@ -628,21 +634,22 @@ async function enrichAndFilterAssetsByCountry(
 
   const uniqueKeys = Array.from(coordKeyToRep.keys());
   const persisted = await readImportGeoCountryCache(uniqueKeys);
-  const countryByCoordKey = new Map<string, string | null>();
+  // Map stores ISO 3166-1 alpha-2 codes (or null for no-country / geocoding failure).
+  const isoByCoordKey = new Map<string, string | null>();
   for (const k of uniqueKeys) {
     if (persisted.has(k)) {
-      countryByCoordKey.set(k, persisted.get(k)!);
+      isoByCoordKey.set(k, persisted.get(k)!);
     }
   }
 
-  const keysNeedingNetwork = uniqueKeys.filter((k) => !countryByCoordKey.has(k));
+  const keysNeedingNetwork = uniqueKeys.filter((k) => !isoByCoordKey.has(k));
   const geoDenom = Math.max(1, keysNeedingNetwork.length);
 
   if (keysNeedingNetwork.length === 0) {
     emitCountry(readTotal, readTotal, 100);
   } else {
     const locationModule = await import('expo-location');
-    const geoWrites: Array<{ key: string; country: string | null }> = [];
+    const geoWrites: Array<{ key: string; isoCode: string | null }> = [];
     let geoDone = 0;
 
     await mapWithConcurrency(
@@ -651,12 +658,22 @@ async function enrichAndFilterAssetsByCountry(
       async (key) => {
         throwIfAborted(signal);
         const rep = coordKeyToRep.get(key);
-        let country: string | null = null;
+        let isoCode: string | null = null;
         if (rep) {
-          country = await getCountryFromCoordinates(rep.lat, rep.lng, { locationModule });
+          try {
+            const addresses = await locationModule.reverseGeocodeAsync({
+              latitude: rep.lat,
+              longitude: rep.lng,
+            });
+            // isoCountryCode ("IT", "FR", …) is locale-invariant; prefer over addresses[0].country
+            // which is localized and would fail the comparison on non-English devices.
+            isoCode = addresses[0]?.isoCountryCode?.toUpperCase() ?? null;
+          } catch (err) {
+            logger.warn('ImportLatest: reverseGeocode failed', { key, err });
+          }
         }
-        countryByCoordKey.set(key, country);
-        geoWrites.push({ key, country });
+        isoByCoordKey.set(key, isoCode);
+        geoWrites.push({ key, isoCode });
         geoDone++;
         const combinedDone = readTotal + geoDone;
         const combinedTotal = readTotal + keysNeedingNetwork.length;
@@ -672,15 +689,33 @@ async function enrichAndFilterAssetsByCountry(
     }
   }
 
+  // Pass 1: GPS-tagged assets confirmed in the target country.
   const results: MediaAsset[] = [];
   for (const { asset, resolved } of rows) {
     const lat = resolved.latitude;
     const lng = resolved.longitude;
     if (lat == null || lng == null) continue;
     const ck = importLatestCoordBucketKey(lat, lng);
-    const country = countryByCoordKey.get(ck) ?? null;
-    if (country && country.trim().toLowerCase() === normalizedTarget) {
+    const iso = isoByCoordKey.get(ck) ?? null;
+    if (iso && iso === targetIso) {
       results.push({ ...asset, latitude: lat, longitude: lng });
+    }
+  }
+
+  // Pass 2: assets without GPS that are temporally adjacent (≤ 30 min) to a confirmed GPS asset.
+  // Captures indoor shots, burst sequences, and photos taken in airplane mode during the same
+  // experience — they would otherwise be silently dropped.
+  if (results.length > 0) {
+    const matchedTimes = results.map((a) => a.creationTime);
+    for (const { asset, resolved } of rows) {
+      if (resolved.latitude != null && resolved.longitude != null) continue; // already handled in pass 1
+      const nearestGap = matchedTimes.reduce(
+        (min, t) => Math.min(min, Math.abs(asset.creationTime - t)),
+        Infinity
+      );
+      if (nearestGap <= TIME_WINDOW_MS) {
+        results.push(asset); // no lat/lng; clustering will group by time proximity only
+      }
     }
   }
 
@@ -712,6 +747,11 @@ export async function runImportLatest(options?: ImportLatestRange | RunImportLat
       !!countryName && Array.isArray(selectedYears) && selectedYears.length > 0;
 
     const isCountryFlow = !!countryName && countryName.length > 0;
+    const targetIso = isCountryFlow ? (getIsoCodeForCountryName(countryName!) ?? null) : null;
+    if (isCountryFlow && !targetIso) {
+      logger.warn('ImportLatest: could not resolve ISO code for country', { countryName });
+      return { suggestions: [], error: 'Could not identify selected country.' };
+    }
     if (isCountryFlow) {
       normalizedOptions.onProgress?.({
         phase: 'fetch',
@@ -739,10 +779,10 @@ export async function runImportLatest(options?: ImportLatestRange | RunImportLat
 
     let galleryAssetInfoById: Map<string, GalleryResolvedAssetInfo> | undefined;
     let assetsForClustering: MediaAsset[];
-    if (countryName && countryName.length > 0) {
+    if (isCountryFlow && targetIso) {
       const enriched = await enrichAndFilterAssetsByCountry(
         rawAssets,
-        countryName,
+        targetIso,
         normalizedOptions.onProgress,
         normalizedOptions.signal
       );
@@ -787,51 +827,58 @@ export async function runImportLatest(options?: ImportLatestRange | RunImportLat
     });
 
     // Resolve displayable URIs for each asset (iOS returns ph:// which Image cannot load).
+    // Run concurrently — the country flow already has results cached in galleryAssetInfoById;
+    // the date flow benefits from parallel native I/O here.
     const allAssetIds = rawSuggestions.flatMap((s) => s.assets.map((a) => a.id));
-    const assetInfos: Array<{
-      localUri: string | null;
-      exif: object | null;
-      latitude: number | null;
-      longitude: number | null;
-    }> = [];
-    for (const id of allAssetIds) {
-      throwIfAborted(normalizedOptions.signal);
-      if (galleryAssetInfoById?.has(id)) {
-        const cached = galleryAssetInfoById.get(id)!;
-        assetInfos.push({
-          localUri: cached.localUri,
-          exif: cached.exif,
-          latitude: cached.latitude,
-          longitude: cached.longitude,
-        });
-        continue;
-      }
-      try {
-        const info = await MediaLibrary.getAssetInfoAsync(id);
-        const loc = info.location;
-        // iOS native returns latitude/longitude as strings despite the TypeScript type saying number.
-        // Use parseFloat(String()) to handle both string and number values safely.
-        let lat: number | null = null;
-        let lng: number | null = null;
-        if (loc != null && typeof loc === 'object') {
-          const rawLat = (loc as Record<string, unknown>).latitude;
-          const rawLng = (loc as Record<string, unknown>).longitude;
-          const parsedLat = parseFloat(String(rawLat));
-          const parsedLng = parseFloat(String(rawLng));
-          if (Number.isFinite(parsedLat)) lat = parsedLat;
-          if (Number.isFinite(parsedLng)) lng = parsedLng;
+    const assetInfos = await mapWithConcurrency(
+      allAssetIds,
+      ASSET_INFO_CONCURRENCY,
+      async (id) => {
+        throwIfAborted(normalizedOptions.signal);
+        if (galleryAssetInfoById?.has(id)) {
+          const cached = galleryAssetInfoById.get(id)!;
+          if (cached.localUri != null) {
+            // Fast path: localUri already resolved (asset was locally available during country filter).
+            return {
+              localUri: cached.localUri,
+              exif: cached.exif,
+              latitude: cached.latitude,
+              longitude: cached.longitude,
+            };
+          }
+          // localUri is null — the country filter used shouldDownloadFromNetwork:false and this
+          // asset was iCloud-offloaded at the time. Fall through to fetch with network access.
         }
-        assetInfos.push({
-          localUri: info.localUri ?? null,
-          exif: info.exif ?? null,
-          latitude: lat,
-          longitude: lng,
-        });
-      } catch (err) {
-        logger.warn('ImportLatest: getAssetInfoAsync failed', { id, err });
-        assetInfos.push({ localUri: null, exif: null, latitude: null, longitude: null });
-      }
-    }
+        try {
+          // No shouldDownloadFromNetwork:false here — localUri requires the asset to be locally
+          // available, and iCloud photos must be downloaded to produce a renderable file URI.
+          const info = await MediaLibrary.getAssetInfoAsync(id);
+          const loc = info.location;
+          // iOS native returns latitude/longitude as strings despite the TypeScript type saying number.
+          // Use parseFloat(String()) to handle both string and number values safely.
+          let lat: number | null = null;
+          let lng: number | null = null;
+          if (loc != null && typeof loc === 'object') {
+            const rawLat = (loc as Record<string, unknown>).latitude;
+            const rawLng = (loc as Record<string, unknown>).longitude;
+            const parsedLat = parseFloat(String(rawLat));
+            const parsedLng = parseFloat(String(rawLng));
+            if (Number.isFinite(parsedLat)) lat = parsedLat;
+            if (Number.isFinite(parsedLng)) lng = parsedLng;
+          }
+          return {
+            localUri: info.localUri ?? null,
+            exif: info.exif ?? null,
+            latitude: lat,
+            longitude: lng,
+          };
+        } catch (err) {
+          logger.warn('ImportLatest: getAssetInfoAsync failed', { id, err });
+          return { localUri: null, exif: null, latitude: null, longitude: null };
+        }
+      },
+      normalizedOptions.signal
+    );
 
     let idx = 0;
     const suggestions: SuggestedExperienceWithDisplayUris[] = rawSuggestions.map((s) => ({
@@ -896,6 +943,111 @@ export async function runImportLatest(options?: ImportLatestRange | RunImportLat
     return {
       suggestions: [],
       error: e instanceof Error ? e.message : 'Could not load recent photos.',
+    };
+  }
+}
+
+/**
+ * Run the import pipeline on a pre-selected set of photos from expo-image-picker.
+ * Bypasses all MediaLibrary fetching — goes straight to cluster → rank → suggest.
+ */
+export async function runImportFromSelectedAssets(
+  pickedAssets: PickedGalleryAsset[],
+  options?: RunImportFromSelectionOptions
+): Promise<ImportLatestResult> {
+  const { onProgress, signal, maxSuggestions = MAX_SUGGESTED_EXPERIENCES } = options ?? {};
+
+  try {
+    throwIfAborted(signal);
+
+    if (pickedAssets.length === 0) return { suggestions: [] };
+
+    onProgress?.({
+      phase: 'fetch',
+      completed: 0,
+      total: pickedAssets.length,
+      percent: 0,
+      label: 'Preparing photos…',
+    });
+
+    // Convert picker assets to MediaAsset[], extracting timestamp and GPS from EXIF.
+    const mediaAssets: MediaAsset[] = [];
+    for (const picked of pickedAssets) {
+      if (!picked.uri) continue;
+      const exif = picked.exif ?? null;
+      const creationTime = parseExifDateTimeToMs(exif) ?? Date.now();
+      const normalizedExif = normalizeExifForMetadata(exif);
+      const coords = normalizedExif ? getDecimalCoordinatesFromExif(normalizedExif) : null;
+      // Use MediaLibrary assetId when available so duplicate detection by asset ID works.
+      const id = picked.assetId ?? picked.uri;
+      mediaAssets.push({
+        id,
+        uri: picked.uri,
+        creationTime,
+        width: picked.width,
+        height: picked.height,
+        ...(coords ? { latitude: coords.latitude, longitude: coords.longitude } : {}),
+      });
+    }
+
+    throwIfAborted(signal);
+
+    if (mediaAssets.length === 0) return { suggestions: [] };
+
+    onProgress?.({ phase: 'cluster', completed: 1, total: 1, percent: 50, label: 'Grouping moments…' });
+
+    const clusters = clusterAssets(mediaAssets);
+    const withSamples = clusters.map((cluster) => ({
+      cluster,
+      selected: selectRepresentativeAssets(cluster),
+    }));
+    const rawSuggestions = rankAndCapClusters(withSamples, maxSuggestions);
+
+    throwIfAborted(signal);
+    onProgress?.({ phase: 'finalize', completed: 1, total: 1, percent: 85, label: 'Preparing suggestions…' });
+
+    // Picker assets already have file:// URIs — no localUri resolution needed.
+    const suggestions: SuggestedExperienceWithDisplayUris[] = rawSuggestions.map((s) => ({
+      ...s,
+      assets: s.assets.map((a) => {
+        const original = pickedAssets.find((p) => (p.assetId ?? p.uri) === a.id);
+        return { ...a, displayUri: a.uri, exif: original?.exif ?? null };
+      }),
+    }));
+
+    // Enrich suggestion-level location: prefer asset.latitude/longitude, fall back to EXIF.
+    for (const s of suggestions) {
+      throwIfAborted(signal);
+      if (s.latitude != null && s.longitude != null) continue;
+      for (const asset of s.assets) {
+        if (asset.latitude != null && asset.longitude != null) {
+          s.latitude = asset.latitude;
+          s.longitude = asset.longitude;
+          break;
+        }
+      }
+      if (s.latitude != null) continue;
+      for (const asset of s.assets) {
+        const normalizedExif = normalizeExifForMetadata(asset.exif);
+        if (normalizedExif) {
+          const coords = getDecimalCoordinatesFromExif(normalizedExif);
+          if (coords) {
+            s.latitude = coords.latitude;
+            s.longitude = coords.longitude;
+            break;
+          }
+        }
+      }
+    }
+
+    onProgress?.({ phase: 'done', completed: 1, total: 1, percent: 100, label: 'Suggestions ready' });
+    return { suggestions };
+  } catch (e) {
+    if (isImportLatestAbortedError(e)) return { suggestions: [] };
+    logger.error('ImportLatest: runImportFromSelectedAssets failed', e);
+    return {
+      suggestions: [],
+      error: e instanceof Error ? e.message : 'Could not process selected photos.',
     };
   }
 }

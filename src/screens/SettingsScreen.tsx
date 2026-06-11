@@ -1,5 +1,5 @@
 // SettingsScreen
-// Studio settings: appearance, username, restart app.
+// App settings: appearance, username, restart app.
 
 import React, { useCallback, useMemo, useState } from 'react';
 import {
@@ -41,12 +41,14 @@ const SettingsScreen: React.FC = () => {
     setTravelMode,
     showHomeMap,
     setShowHomeMap,
+    resetOnboarding,
   } = useAppContext();
 
   const [usernameModalVisible, setUsernameModalVisible] = useState(false);
   const [usernameInput, setUsernameInput] = useState(userName ?? '');
   const [savingName, setSavingName] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [restartingOnboarding, setRestartingOnboarding] = useState(false);
 
 
   const openUsernameModal = useCallback(() => {
@@ -105,6 +107,32 @@ const SettingsScreen: React.FC = () => {
     [travelModeEnabled, setTravelMode]
   );
 
+  const handleRestartOnboarding = useCallback(() => {
+    Alert.alert(
+      'Restart onboarding?',
+      'Your data and memories are kept. You\'ll see the onboarding sequence again on next open. Phase 0 fields will be pre-filled.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Restart Onboarding',
+          onPress: async () => {
+            setRestartingOnboarding(true);
+            try {
+              await resetOnboarding();
+              navigation.dispatch(
+                CommonActions.reset({ index: 0, routes: [{ name: 'OnboardingGate' }] })
+              );
+            } catch (error) {
+              logger.error('Settings: restart onboarding failed', error);
+              setRestartingOnboarding(false);
+              Alert.alert('Error', 'Could not restart onboarding. Please try again.');
+            }
+          },
+        },
+      ]
+    );
+  }, [resetOnboarding, navigation]);
+
   const handleRestart = useCallback(() => {
     Alert.alert(
       'Restart app?',
@@ -119,7 +147,7 @@ const SettingsScreen: React.FC = () => {
             try {
               await resetApp();
               navigation.dispatch(
-                CommonActions.reset({ index: 0, routes: [{ name: 'Welcome' }] })
+                CommonActions.reset({ index: 0, routes: [{ name: 'OnboardingGate' }] })
               );
             } catch (error) {
               logger.error('Settings: reset failed', error);
@@ -388,6 +416,23 @@ const SettingsScreen: React.FC = () => {
         </View>
 
         <Text style={styles.sectionHeader}>APP</Text>
+        <View style={[styles.sectionBlock]}>
+          <TouchableOpacity
+            style={[styles.row, styles.rowFirst, styles.rowLast, styles.rowSingle]}
+            onPress={handleRestartOnboarding}
+            disabled={restartingOnboarding}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="Restart onboarding"
+          >
+            <Text style={styles.rowLabel}>Restart Onboarding</Text>
+            {restartingOnboarding ? (
+              <LoadingSpinner size="small" />
+            ) : (
+              <Ionicons name="refresh-outline" size={20} color={colors.textSecondary} />
+            )}
+          </TouchableOpacity>
+        </View>
         <TouchableOpacity
           style={styles.rowDestructive}
           onPress={handleRestart}

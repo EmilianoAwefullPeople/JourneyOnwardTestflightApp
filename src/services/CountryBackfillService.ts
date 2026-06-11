@@ -2,7 +2,6 @@
 // Persists location text (country/city) on entries with coordinates but missing saved values.
 // First applies AsyncStorage entry location cache, then reverse-geocodes remaining rows.
 
-import { Entry } from '../models/Entry';
 import * as PersistenceManager from '../storage/PersistenceManager';
 import { loadEntryLocationCache } from '../utils/entryLocationCache';
 import { attachCountryToEntryIfMissing } from '../utils/entryCountryResolve';
@@ -13,8 +12,6 @@ const MAX_ENTRIES_PER_RUN = 25;
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export type UpdateEntryFn = (entry: Entry) => Promise<void>;
-
 export interface CountryBackfillOptions {
   onProgress?: (filled: number) => void;
   maxEntries?: number;
@@ -23,8 +20,9 @@ export interface CountryBackfillOptions {
 
 /**
  * For entries missing saved location text, copy from `@jo_entry_loc_v1` when present.
+ * Uses a scoped DB update that never touches photo paths.
  */
-export async function mergeCountryFromEntryLocationCache(updateEntry: UpdateEntryFn): Promise<number> {
+export async function mergeCountryFromEntryLocationCache(): Promise<number> {
   let filled = 0;
   try {
     const cache = await loadEntryLocationCache();
@@ -34,11 +32,11 @@ export async function mergeCountryFromEntryLocationCache(updateEntry: UpdateEntr
       const city = cache[entry.id]?.city?.trim();
       if (!c && !city) continue;
       try {
-        await updateEntry({
-          ...entry,
-          country: entry.country?.trim() || c || undefined,
-          city: entry.city?.trim() || city || undefined,
-        });
+        await PersistenceManager.updateEntryLocationText(
+          entry.id,
+          entry.country?.trim() || c || null,
+          entry.city?.trim() || city || null
+        );
         filled++;
       } catch (e) {
         logger.warn('CountryBackfill: cache merge update failed', entry.id, e);
@@ -55,17 +53,17 @@ export async function mergeCountryFromEntryLocationCache(updateEntry: UpdateEntr
 
 /**
  * Fills location text via reverse geocode for entries still missing it after cache merge.
+ * Uses a scoped DB update that never touches photo paths.
  */
 export async function runCountryBackfill(
-  updateEntry: UpdateEntryFn,
   options?: CountryBackfillOptions
 ): Promise<void> {
-  await mergeCountryFromEntryLocationCache(updateEntry);
+  await mergeCountryFromEntryLocationCache();
 
   const maxEntries = options?.maxEntries ?? MAX_ENTRIES_PER_RUN;
   const delayMs = options?.delayMs ?? DELAY_BETWEEN_GEOCODE_MS;
 
-  let entries: Entry[];
+  let entries;
   try {
     entries = await PersistenceManager.getEntriesMissingLocationText(maxEntries);
   } catch (error) {
@@ -95,7 +93,11 @@ export async function runCountryBackfill(
         await delay(delayMs);
         continue;
       }
-      await updateEntry(updated);
+      await PersistenceManager.updateEntryLocationText(
+        entry.id,
+        updated.country?.trim() ?? null,
+        updated.city?.trim() ?? null
+      );
       filled++;
       options?.onProgress?.(filled);
     } catch (error) {

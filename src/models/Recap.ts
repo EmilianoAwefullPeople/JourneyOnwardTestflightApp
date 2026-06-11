@@ -1,70 +1,149 @@
-// Recap Model
-// Types for Journey Recap: candidates (trip albums eligible for recap) and slides (story-style cards)
-
 import { TripAlbum } from './TripAlbum';
 
-/** A trip album that has at least one entry and can be turned into a recap. */
 export interface RecapCandidate {
-  id: string; // album id
+  id: string;
   album: TripAlbum;
   displayName: string;
   dateRange: string;
   entryIds: string[];
-  previewImageUris: string[]; // first 1–2 for list card
+  previewImageUris: string[];
 }
 
-/** Slide type for the recap player. */
-export type RecapSlideType = 'title' | 'stat' | 'highlight' | 'collage' | 'outro';
-
-/** Payload for title slide. */
-export interface RecapSlideTitlePayload {
-  displayName: string;
-  startDate: string;
-  endDate: string;
-  /** Optional line above the title (e.g. "Your journey"). */
-  subtitle?: string;
+export interface PostcardItem {
+  photoUri: string;
+  location?: string;
 }
 
-/** Payload for stat slide. */
-export interface RecapSlideStatPayload {
-  value: number;
-  label: string;
-  /** Optional line above the value (e.g. "You captured", "You had"). */
-  prefix?: string;
+export type RecapSlideType =
+  | 'opening_screen'
+  | 'title_card'
+  | 'opening_stats'
+  | 'beginning_of_trip_photos'
+  | 'activity_multiple_choice'
+  | 'activity_distribution_graph'
+  | 'color_palette'
+  | 'color_palette_photo'
+  | 'emotion_data'
+  | 'journal_data'
+  | 'location_data'
+  | 'graphic_location_data'
+  | 'middle_of_trip_photos'
+  | 'weather_data'
+  | 'temperature_data'
+  | 'altitude_data'
+  | 'end_of_trip_photos';
+
+export interface OpeningScreenPayload {
+  postcards: PostcardItem[];
 }
 
-/** Payload for highlight slide (single entry photo). */
-export interface RecapSlideHighlightPayload {
-  entryId: string;
-  mediaUri: string;
-  caption?: string;
+export interface TitleCardPayload {
+  tripName: string;
+  dateRange: string;
+  backgroundPhotoUri?: string;
 }
 
-/** Payload for collage slide (2–4 images). */
-export interface RecapSlideCollagePayload {
-  entryIds: string[];
-  mediaUris: string[];
-  /** Optional one-line label above the grid (e.g. "Your highlights"). */
-  label?: string;
+export interface OpeningStatsPayload {
+  tripDays: number;
+  memoriesCount: number;
+  photosCount: number;
+  journalCount: number;
 }
 
-/** Payload for outro slide. */
-export interface RecapSlideOutroPayload {
-  message: string;
+export interface BeginningPhotosPayload {
+  bgPhotoUri: string;
+  postcards: PostcardItem[];
+}
+
+export interface ActivityMultipleChoicePayload {
+  peakDay: string;
+  choices: string[];
+}
+
+export interface ActivityDistributionPayload {
+  data: Array<{ date: string; count: number }>;
+  xAxisMode: 'days' | 'weeks';
+}
+
+export interface ColorPalettePayload {
+  colors: string[];
+  tripLabel: string;
+}
+
+export interface ColorPalettePhotoPayload {
+  colors: string[];
+  photoUri: string;
+}
+
+export interface EmotionDataPayload {
+  emotions: Array<{ label: string; count: number }>;
+}
+
+export interface JournalDataPayload {
+  words: number;
+  sentences: number;
+  chapters: number;
+}
+
+export interface LocationDataPayload {
+  totalPlaces: number;
+  topPlaces: Array<{ name: string; count: number }>;
+}
+
+export interface GraphicLocationDataPayload {
+  locations: Array<{ latitude: number; longitude: number; label: string }>;
+  cityList: string[];
+  postcard: PostcardItem;
+}
+
+export interface MiddlePhotosPayload {
+  photoUris: string[];
+}
+
+export interface WeatherDataPayload {
+  conditions: Array<{ condition: string; percentage: number }>;
+  photoUri: string;
+}
+
+export interface TemperatureDataPayload {
+  averageCelsius: number;
+  lowestCelsius: number;
+  highestCelsius: number;
+  photoUri: string;
+}
+
+export interface AltitudeDataPayload {
+  lowest: { altitudeMeters: number; photoUri: string };
+  highest: { altitudeMeters: number; photoUri: string };
+}
+
+export interface EndPhotosPayload {
+  postcards: PostcardItem[];
 }
 
 export type RecapSlidePayload =
-  | { type: 'title'; payload: RecapSlideTitlePayload }
-  | { type: 'stat'; payload: RecapSlideStatPayload }
-  | { type: 'highlight'; payload: RecapSlideHighlightPayload }
-  | { type: 'collage'; payload: RecapSlideCollagePayload }
-  | { type: 'outro'; payload: RecapSlideOutroPayload };
+  | OpeningScreenPayload
+  | TitleCardPayload
+  | OpeningStatsPayload
+  | BeginningPhotosPayload
+  | ActivityMultipleChoicePayload
+  | ActivityDistributionPayload
+  | ColorPalettePayload
+  | ColorPalettePhotoPayload
+  | EmotionDataPayload
+  | JournalDataPayload
+  | LocationDataPayload
+  | GraphicLocationDataPayload
+  | MiddlePhotosPayload
+  | WeatherDataPayload
+  | TemperatureDataPayload
+  | AltitudeDataPayload
+  | EndPhotosPayload;
 
-/** A single slide in the recap sequence. */
 export interface RecapSlide {
   id: string;
   type: RecapSlideType;
   durationMs: number;
-  /** Type-narrowed payload; use slide.type to discriminate. */
-  payload: RecapSlideTitlePayload | RecapSlideStatPayload | RecapSlideHighlightPayload | RecapSlideCollagePayload | RecapSlideOutroPayload;
+  interactive?: boolean;
+  payload: RecapSlidePayload;
 }

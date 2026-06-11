@@ -29,53 +29,25 @@ import BackArrow from '../components/common/icons/BackArrow';
 import { Ionicons } from '@expo/vector-icons';
 import { useAppContext } from '../context/AppContext';
 import { logger } from '../utils/logger';
-import { generateUUID } from '../utils/uuid';
-import { findMatchingAlbumId } from '../utils/albumUtils';
-import { getSeasonFromTimestamp } from '../utils/seasonUtils';
-import { getWeatherAtLocation } from '../services/WeatherService';
 import { formatEntryDate, reverseGeocode } from '../utils/dateUtils';
-import { getAltitudeMetersFromExif, normalizeExifForMetadata } from '../utils/exifUtils';
-import { Entry } from '../models/Entry';
-import { attachCountryToEntryIfMissing } from '../utils/entryCountryResolve';
-import { copyMediaToPersistentStorage, deletePersistentMediaForEntry } from '../storage/mediaStorage';
 import type {
   ImportLatestProgress,
   ImportLatestRange,
+  PickedGalleryAsset,
   SuggestedExperienceWithDisplayUris,
 } from '../services/ImportLatestService';
-import { isImportLatestAbortedError, runImportLatest } from '../services/ImportLatestService';
-import { getImportedAssetIds, addImportedAssetIds } from '../utils/importLatestStorage';
+import { isImportLatestAbortedError } from '../services/ImportLatestService';
+import * as ImagePicker from 'expo-image-picker';
+import {
+  discoverExperienceSuggestions,
+  persistSelectedExperiences,
+} from '../services/ExperienceImportService';
 import { ANIMATION_CONFIG, createStaggeredDelay } from '../utils/animations';
 import { getCountryFlagEmoji, getKnownCountryNames } from '../utils/countryUtils';
 import LoadingSpinner from '../components/common/LoadingSpinner';
 
 type ImportLatestNavigationProp = NativeStackNavigationProp<RootStackParamList, 'ImportLatest'>;
-type SyncMode = 'date' | 'country';
-
-/** Returns true if suggestion is already saved (by imported asset ID or by same photo path in an entry). */
-function isDuplicateSuggestion(
-  suggestion: SuggestedExperienceWithDisplayUris,
-  entries: Entry[],
-  importedIds: Set<string>
-): boolean {
-  if (suggestion.assets.some((a) => importedIds.has(a.id))) return true;
-  const loadableUris = suggestion.assets
-    .map((a) => a.displayUri ?? (a.uri.startsWith('file://') ? a.uri : null))
-    .filter((u): u is string => typeof u === 'string' && u.length > 0);
-  if (loadableUris.length === 0) return false;
-  const uriSet = new Set(loadableUris);
-  for (const entry of entries) {
-    const paths = [...(entry.photoPaths ?? []), ...(entry.mediaPaths ?? [])];
-    if (paths.some((p) => uriSet.has(p))) return true;
-  }
-  return false;
-}
-
-function getMissingColumnNameFromError(error: unknown): string | null {
-  const message = String(error ?? '');
-  const match = message.match(/no column named\s+([a-zA-Z0-9_]+)/i);
-  return match?.[1] ?? null;
-}
+type SyncMode = 'date' | 'country' | 'gallery';
 
 /** One decimal, clamped 0–100, for import progress bar label. */
 function formatImportProgressPercent(percent: number): string {
@@ -86,6 +58,8 @@ function formatImportProgressPercent(percent: number): string {
 type ScreenState = 'filter' | 'loading' | 'list' | 'saving' | 'done' | 'error';
 type QuickFilter = 'last24h' | 'last72h' | 'custom';
 
+const GALLERY_SELECTION_LIMIT = 50;
+
 const ImportLatestScreen: React.FC = () => {
   const navigation = useNavigation<ImportLatestNavigationProp>();
   const insets = useSafeAreaInsets();
@@ -94,6 +68,7 @@ const ImportLatestScreen: React.FC = () => {
 
   const [state, setState] = useState<ScreenState>('filter');
   const [syncMode, setSyncMode] = useState<SyncMode | null>(null);
+  const [isAwaitingGallery, setIsAwaitingGallery] = useState(false);
   const [selectedFilter, setSelectedFilter] = useState<QuickFilter>('last72h');
   const [selectedCountry, setSelectedCountry] = useState<string | null>(null);
   const [selectedYears, setSelectedYears] = useState<number[]>([]);
@@ -166,24 +141,27 @@ const ImportLatestScreen: React.FC = () => {
     const scanController = new AbortController();
     importScanAbortRef.current = scanController;
     try {
-      const result = await runImportLatest({
-        range,
-        countryName,
-        selectedYears: years,
-        signal: scanController.signal,
-        onProgress: (progress: ImportLatestProgress) => {
-          setProgressPercent(progress.percent);
-          setProgressLabel(progress.label);
-          const showCounts =
-            progress.total > 0 &&
-            (progress.total > 1 ||
-              progress.phase === 'fetch' ||
-              progress.phase === 'country');
-          if (showCounts) {
-            setProgressDetail(`${progress.completed}/${progress.total}`);
-          } else {
-            setProgressDetail('');
-          }
+      const result = await discoverExperienceSuggestions({
+        kind: 'latest',
+        options: {
+          range,
+          countryName,
+          selectedYears: years,
+          signal: scanController.signal,
+          onProgress: (progress: ImportLatestProgress) => {
+            setProgressPercent(progress.percent);
+            setProgressLabel(progress.label);
+            const showCounts =
+              progress.total > 0 &&
+              (progress.total > 1 ||
+                progress.phase === 'fetch' ||
+                progress.phase === 'country');
+            if (showCounts) {
+              setProgressDetail(`${progress.completed}/${progress.total}`);
+            } else {
+              setProgressDetail('');
+            }
+          },
         },
       });
       if (result.error) {
@@ -191,11 +169,7 @@ const ImportLatestScreen: React.FC = () => {
         setState('error');
         return;
       }
-      const importedIds = await getImportedAssetIds();
-      const filtered = result.suggestions.filter(
-        (s) => !s.assets.some((a) => importedIds.has(a.id))
-      );
-      setSuggestions(filtered);
+      setSuggestions(result.suggestions);
       setAcceptedIds(new Set());
       setProgressPercent(100);
       setProgressLabel('Suggestions ready');
@@ -310,43 +284,6 @@ const ImportLatestScreen: React.FC = () => {
     });
   }, []);
 
-  const buildEntryFromSuggestion = useCallback(
-    (suggestion: SuggestedExperienceWithDisplayUris): Entry => {
-      const timestamp = suggestion.timestamp;
-      const locationProps =
-        suggestion.latitude != null && suggestion.longitude != null
-          ? { latitude: suggestion.latitude, longitude: suggestion.longitude }
-          : {};
-      const matchingAlbumId = findMatchingAlbumId(timestamp, tripAlbums ?? []);
-      // Use only loadable URIs (displayUri/file) so entry detail and other screens can render images.
-      const loadableUris = suggestion.assets
-        .map((a) => a.displayUri ?? (a.uri.startsWith('file://') ? a.uri : null))
-        .filter((u): u is string => typeof u === 'string' && u.length > 0);
-      const altitudeMeters = getAltitudeMetersFromExif(
-        normalizeExifForMetadata(suggestion.assets[0]?.exif) ?? undefined
-      );
-      return {
-        id: generateUUID(),
-        type: 'experience',
-        title: undefined,
-        description: '',
-        mediaType: 'photo',
-        photoPaths: loadableUris,
-        mediaPaths: loadableUris,
-        storageUrls: [],
-        timestamp,
-        ...locationProps,
-        ...(matchingAlbumId ? { albumId: matchingAlbumId } : {}),
-        season: getSeasonFromTimestamp(timestamp, suggestion.latitude),
-        ...(altitudeMeters != null ? { altitudeMeters } : {}),
-        isDraft: false,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-    },
-    [tripAlbums]
-  );
-
   const handleAddExperiences = useCallback(async () => {
     const toAdd = suggestions.filter((s) => acceptedIds.has(s.id));
     if (toAdd.length === 0) return;
@@ -357,129 +294,30 @@ const ImportLatestScreen: React.FC = () => {
 
     setState('saving');
     setSchemaFailureNotice('');
-    let added = 0;
-    let failed = 0;
-    let skippedDuplicates = 0;
-    const createdSuggestions: SuggestedExperienceWithDisplayUris[] = [];
-    let schemaIssueDetected = false;
-    let schemaIssueNotice = '';
-
     try {
-      const importedIds = await getImportedAssetIds();
-      const totalToProcess = Math.max(1, toAdd.length);
-      let processed = 0;
-      let sharedLocationModule: typeof import('expo-location') | null = null;
-
-      for (const suggestion of toAdd) {
-        if (saveController.signal.aborted) {
-          logger.log('ImportLatestScreen: add experiences cancelled');
-          break;
-        }
-        if (isDuplicateSuggestion(suggestion, entries, importedIds)) {
-          skippedDuplicates++;
-          processed++;
-          continue;
-        }
-        let entry = buildEntryFromSuggestion(suggestion);
-        try {
-          if (entry.photoPaths.length > 0) {
-            try {
-              const persistentUris = await copyMediaToPersistentStorage(entry.photoPaths, entry.id);
-              entry.photoPaths = persistentUris;
-              entry.mediaPaths = persistentUris;
-            } catch (copyError) {
-              logger.error('ImportLatestScreen: copy to persistent storage failed', copyError);
-              deletePersistentMediaForEntry(entry.id);
-              failed++;
-              processed++;
-              continue;
-            }
-          }
-          if (saveController.signal.aborted) break;
-          if (
-            entry.latitude != null &&
-            entry.longitude != null
-          ) {
-            try {
-              const weather = await getWeatherAtLocation(entry.latitude, entry.longitude);
-              if (weather) {
-                entry.weather = weather.condition;
-                entry.temperatureCelsius = weather.temperatureCelsius;
-              }
-            } catch (_) {
-              // non-blocking
-            }
-          }
-          if (saveController.signal.aborted) break;
-          if (
-            entry.latitude != null &&
-            entry.longitude != null &&
-            (!entry.country?.trim() || !entry.city?.trim())
-          ) {
-            try {
-              if (!sharedLocationModule) {
-                sharedLocationModule = await import('expo-location');
-              }
-              entry = await attachCountryToEntryIfMissing(entry, { locationModule: sharedLocationModule });
-            } catch (_) {
-              // non-blocking
-            }
-          }
-          if (saveController.signal.aborted) break;
-          await createEntry(entry);
-          if (saveController.signal.aborted) break;
-          added++;
-          createdSuggestions.push(suggestion);
-          processed++;
-        } catch (e) {
-          const missingColumn = getMissingColumnNameFromError(e);
-          if (missingColumn) {
-            schemaIssueDetected = true;
-            schemaIssueNotice =
-              'Database schema issue prevented full import. Please restart the app and retry Import Latest.';
-            logger.error('ImportLatestScreen: schema mismatch during createEntry; stopping batch', {
-              missingColumn,
-              entryId: entry.id,
-            });
-          }
-          logger.error('ImportLatestScreen: createEntry failed', e);
-          logger.warn('IMPORT_LATEST_CLEANUP: deleting copied media for failed entry', { entryId: entry.id });
-          deletePersistentMediaForEntry(entry.id);
-          failed++;
-          processed++;
-          if (schemaIssueDetected) break;
-        }
-      }
-
+      const result = await persistSelectedExperiences({
+        suggestions,
+        selectedIds: acceptedIds,
+        existingEntries: entries,
+        tripAlbums: tripAlbums ?? [],
+        createEntry,
+        refreshData,
+        signal: saveController.signal,
+      });
       if (saveController.signal.aborted) {
-        await refreshData();
         return;
       }
-
-      if (createdSuggestions.length > 0) {
-        const newlyImportedIds = createdSuggestions.flatMap((s) => s.assets.map((a) => a.id));
-        await addImportedAssetIds(newlyImportedIds);
-      }
-
-      await refreshData();
-      setAddedCount(added);
-      setFailedCount(failed);
-      setSkippedDuplicateCount(skippedDuplicates);
-      setSchemaFailureNotice(schemaIssueNotice);
-      if (schemaIssueDetected) {
-        logger.warn('ImportLatestScreen: batch ended early due to schema mismatch', {
-          added,
-          failed,
-          skippedDuplicates,
-        });
-      }
+      setAddedCount(result.added);
+      setFailedCount(result.failed);
+      setSkippedDuplicateCount(result.skippedDuplicates);
+      setSchemaFailureNotice(result.schemaFailureNotice ?? '');
       setState('done');
     } finally {
       if (importSaveAbortRef.current === saveController) {
         importSaveAbortRef.current = null;
       }
     }
-  }, [suggestions, acceptedIds, entries, buildEntryFromSuggestion, createEntry, refreshData]);
+  }, [suggestions, acceptedIds, entries, tripAlbums, createEntry, refreshData]);
 
   const handleBack = useCallback(() => {
     if (state === 'loading' || state === 'saving') {
@@ -493,11 +331,11 @@ const ImportLatestScreen: React.FC = () => {
     }
   }, [navigation, state]);
 
-  const handleBackToStudio = useCallback(() => {
+  const handleBackToHome = useCallback(() => {
     try {
-      navigation.navigate('MainTabs', { screen: 'Studio' });
+      navigation.navigate('MainTabs', { screen: 'Home' });
     } catch (e) {
-      logger.warn('ImportLatestScreen: navigate to Studio failed', e);
+      logger.warn('ImportLatestScreen: navigate to Home failed', e);
       navigation.goBack();
     }
   }, [navigation]);
@@ -520,10 +358,96 @@ const ImportLatestScreen: React.FC = () => {
     setState('filter');
   }, []);
 
+  const handlePickFromGallery = useCallback(async () => {
+    setFilterError('');
+    // Activate the overlay before the picker opens so it is already rendered
+    // the moment the picker sheet dismisses — covering any gap between the native
+    // dismiss animation and the JS promise resolving with EXIF data.
+    setIsAwaitingGallery(true);
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      allowsMultipleSelection: true,
+      selectionLimit: GALLERY_SELECTION_LIMIT,
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      exif: true,
+      quality: 1,
+      orderedSelection: false,
+    });
+
+    if (result.canceled || result.assets.length === 0) {
+      setIsAwaitingGallery(false);
+      return;
+    }
+
+    const count = result.assets.length;
+    const pickedLabel = `${count} photo${count !== 1 ? 's' : ''}`;
+    setState('loading');
+    setIsAwaitingGallery(false);
+    setActiveRangeLabel(pickedLabel);
+    setErrorMessage('');
+    setSchemaFailureNotice('');
+    setProgressPercent(0);
+    setProgressLabel(`Grouping ${pickedLabel}…`);
+    setProgressDetail('');
+
+    importScanAbortRef.current?.abort();
+    const scanController = new AbortController();
+    importScanAbortRef.current = scanController;
+
+    try {
+      const picked: PickedGalleryAsset[] = result.assets.map((a) => ({
+        uri: a.uri,
+        width: a.width,
+        height: a.height,
+        assetId: a.assetId ?? null,
+        exif: (a.exif as Record<string, unknown> | null | undefined) ?? null,
+      }));
+
+      const importResult = await discoverExperienceSuggestions({
+        kind: 'selected',
+        assets: picked,
+        options: {
+          signal: scanController.signal,
+          onProgress: (progress) => {
+            setProgressPercent(progress.percent);
+            setProgressLabel(progress.label);
+            setProgressDetail('');
+          },
+        },
+      });
+
+      if (importResult.error) {
+        setErrorMessage(importResult.error);
+        setState('error');
+        return;
+      }
+
+      setSuggestions(importResult.suggestions);
+      setAcceptedIds(new Set());
+      setProgressPercent(100);
+      setProgressLabel('Suggestions ready');
+      setProgressDetail('');
+      setState('list');
+    } catch (e) {
+      if (isImportLatestAbortedError(e)) {
+        logger.log('ImportLatestScreen: gallery scan cancelled');
+        return;
+      }
+      logger.error('ImportLatestScreen: gallery scan failed', e);
+      setErrorMessage('Could not process selected photos.');
+      setState('error');
+    } finally {
+      if (importScanAbortRef.current === scanController) {
+        importScanAbortRef.current = null;
+      }
+    }
+  }, []);
+
   const acceptedCount = acceptedIds.size;
   const isCustomRangeInvalid = customStartDate.getTime() > customEndDate.getTime();
   const isDateMode = syncMode === 'date';
   const isCountryMode = syncMode === 'country';
+  const isGalleryMode = syncMode === 'gallery';
   const isScanDisabled =
     !syncMode ||
     (isDateMode && selectedFilter === 'custom' && isCustomRangeInvalid) ||
@@ -592,6 +516,26 @@ const ImportLatestScreen: React.FC = () => {
               <View style={styles.modeFilterButtonContent}>
                 <Ionicons name="earth-outline" size={18} color={colors.textPrimary} />
                 <Text style={[styles.filterOptionText, { color: colors.textPrimary }]}>Country</Text>
+              </View>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.modeFilterButton,
+                syncMode !== null && !isGalleryMode && styles.modeFilterButtonInactive,
+              ]}
+              onPress={() => {
+                setFilterError('');
+                setSyncMode('gallery');
+                setSelectedCountry(null);
+                setSelectedYears([]);
+                setIsYearPickerOpen(false);
+                handlePickFromGallery();
+              }}
+              activeOpacity={0.7}
+            >
+              <View style={styles.modeFilterButtonContent}>
+                <Ionicons name="images-outline" size={18} color={colors.textPrimary} />
+                <Text style={[styles.filterOptionText, { color: colors.textPrimary }]}>Gallery</Text>
               </View>
             </TouchableOpacity>
           </View>
@@ -773,7 +717,38 @@ const ImportLatestScreen: React.FC = () => {
               </TouchableOpacity>
             </View>
           )}
+          {isGalleryMode && (
+            <View style={styles.filterDetailSection}>
+              <Text style={[styles.galleryHint, { color: colors.textSecondary }]}>
+                Pick any photos from your library. They'll be grouped into experiences by time and location.
+              </Text>
+              {filterError.length > 0 && (
+                <Text style={styles.filterErrorText}>{filterError}</Text>
+              )}
+              <TouchableOpacity
+                style={styles.scanButton}
+                onPress={handlePickFromGallery}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.scanButtonText}>Select photos</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+          <TouchableOpacity
+            style={styles.addManuallyLink}
+            onPress={() => navigation.navigate('AddPastExperiences')}
+            activeOpacity={0.7}
+          >
+            <Text style={[styles.addManuallyLinkText, { color: colors.textSecondary }]}>
+              Or add a past experience manually
+            </Text>
+          </TouchableOpacity>
         </ScrollView>
+        {isAwaitingGallery && (
+          <View style={styles.galleryOverlay}>
+            <LoadingSpinner size="large" />
+          </View>
+        )}
       </View>
     );
   }
@@ -838,7 +813,7 @@ const ImportLatestScreen: React.FC = () => {
       <View style={styles.container}>
         <MeshGradientBackground baseColor={colors.background} lightMode={!isDark} />
         <View style={styles.header}>
-          <TouchableOpacity onPress={handleBackToStudio} style={styles.backButton} activeOpacity={0.7}>
+          <TouchableOpacity onPress={handleBackToHome} style={styles.backButton} activeOpacity={0.7}>
             <BackArrow color={colors.textPrimary} width={24} height={24} />
           </TouchableOpacity>
           <Text style={styles.headerTitle}>Import latest</Text>
@@ -856,8 +831,8 @@ const ImportLatestScreen: React.FC = () => {
           <TouchableOpacity style={styles.primaryButtonFlat} onPress={handleViewHome} activeOpacity={0.7}>
             <Text style={styles.primaryButtonFlatText}>View on Home</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.secondaryButton} onPress={handleBackToStudio} activeOpacity={0.7}>
-            <Text style={styles.secondaryButtonText}>Back to Studio</Text>
+          <TouchableOpacity style={styles.secondaryButton} onPress={handleBackToHome} activeOpacity={0.7}>
+            <Text style={styles.secondaryButtonText}>Back to Home</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -1335,6 +1310,19 @@ function createStyles(colors: ThemeColors, insets: { top: number; bottom: number
       color: colors.textSecondary,
       marginBottom: SPACING.lg,
     },
+    galleryHint: {
+      fontFamily: FONTS.inter,
+      fontSize: 15,
+      lineHeight: 22,
+      marginTop: SPACING.sm,
+      marginBottom: SPACING.md,
+    },
+    galleryOverlay: {
+      ...StyleSheet.absoluteFillObject,
+      backgroundColor: colors.background,
+      alignItems: 'center' as const,
+      justifyContent: 'center' as const,
+    },
     filterOptions: {
       gap: SPACING.sm,
     },
@@ -1613,6 +1601,18 @@ function createStyles(colors: ThemeColors, insets: { top: number; bottom: number
       fontSize: 16,
       fontWeight: FONT_WEIGHTS.semibold,
       color: colors.textPrimary,
+    },
+    addManuallyLink: {
+      alignItems: 'center',
+      paddingVertical: SPACING.md,
+      paddingHorizontal: SPACING.lg,
+      marginTop: SPACING.sm,
+    },
+    addManuallyLinkText: {
+      fontFamily: FONTS.inter,
+      fontSize: 14,
+      fontWeight: FONT_WEIGHTS.regular,
+      textDecorationLine: 'underline',
     },
     secondaryButton: {
       marginTop: SPACING.sm,

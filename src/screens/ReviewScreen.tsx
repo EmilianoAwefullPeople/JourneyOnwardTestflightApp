@@ -10,11 +10,11 @@ import { RootStackParamList, MainTabParamList, ReviewSectionParam } from '../nav
 import { SPACING, FONT_WEIGHTS } from '../config/constants';
 import { TEXT_STYLES } from '../config/typography';
 import { useAppContext } from '../context/AppContext';
-import { useProgress } from '../context/ProgressContext';
 import { useTheme } from '../context/ThemeContext';
 import { MeshGradientBackground } from '../components/common/MeshGradientBackground';
 import SegmentControl, { ReviewSection } from '../components/review/SegmentControl';
 import { useMainTabBarVisibility } from '../navigation/mainTabBarVisibility';
+import { Ionicons } from '@expo/vector-icons';
 
 const VALID_REVIEW_SECTIONS: ReviewSection[] = ['stats', 'tripAlbums', 'bookmarks'];
 
@@ -35,7 +35,6 @@ const ReviewScreen: React.FC = () => {
   const route = useRoute<RouteProp<MainTabParamList, 'Review'>>();
   const insets = useSafeAreaInsets();
   const { entries, journals, tripAlbums, travelModeEnabled, activeTripAlbums } = useAppContext();
-  const { recordReviewSection } = useProgress();
   const { colors, isDark } = useTheme();
   const { visibilityProgress, reportScrollOffset } = useMainTabBarVisibility();
   const [activeSection, setActiveSection] = useState<ReviewSection>(
@@ -92,14 +91,6 @@ const ReviewScreen: React.FC = () => {
     return typeof unsubscribe === 'function' ? unsubscribe : undefined;
   }, [navigation]);
 
-  useEffect(() => {
-    try {
-      recordReviewSection(normalizedSection);
-    } catch (_) {
-      // Non-blocking
-    }
-  }, [normalizedSection, recordReviewSection]);
-
   // Navigation handlers
   const handleEntryPress = (entry: Entry) => {
     navigation.navigate('EntryDetail', { entryId: entry.id });
@@ -116,17 +107,33 @@ const ReviewScreen: React.FC = () => {
   const handleCreateAlbumPress = () => {
     navigation.navigate('TripAlbumCreate');
   };
+
+  const handleSuggestTripsPress = () => {
+    navigation.navigate('SuggestedAlbums');
+  };
   
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
       <MeshGradientBackground baseColor={colors.background} lightMode={!isDark} />
       
       {/* Segment Control */}
-      <View style={[styles.segmentContainer, { paddingTop: insets.top + 20, paddingBottom: SPACING.sm }]}>
-        <SegmentControl
-          activeSegment={normalizedSection}
-          onSegmentChange={setActiveSection}
-        />
+      <View style={[styles.segmentContainer, { paddingTop: insets.top + 12, paddingBottom: SPACING.sm }]}>
+        <View style={styles.settingsRow}>
+          <TouchableOpacity
+            style={[styles.settingsButton, { backgroundColor: colors.surfaceVariant, borderColor: colors.border }]}
+            onPress={() => navigation.navigate('Settings')}
+            accessibilityRole="button"
+            accessibilityLabel="Settings"
+          >
+            <Ionicons name="settings-outline" size={22} color={colors.textPrimary} />
+          </TouchableOpacity>
+        </View>
+        <View style={styles.segmentRow}>
+          <SegmentControl
+            activeSegment={normalizedSection}
+            onSegmentChange={setActiveSection}
+          />
+        </View>
         {/* Gallery (bookmarks) tucks "This Trip" into the All | Bookmarks row */}
         {travelModeEnabled && normalizedSection !== 'bookmarks' && (
           <View style={styles.tripFilterRow}>
@@ -146,8 +153,15 @@ const ReviewScreen: React.FC = () => {
       </View>
 
       <View style={styles.contentContainer}>
+        {/*
+          Gallery sits in absoluteFillObject so FlashList always has valid container
+          dimensions — no remeasure delay when switching to this tab. It is physically
+          covered by the Stats/TripAlbums panels when those are active (they carry an
+          opaque background), so no opacity toggle is needed and no slide occurs.
+        */}
         <View
-          style={[styles.sectionPanel, { display: normalizedSection === 'bookmarks' ? 'flex' : 'none' }]}
+          style={StyleSheet.absoluteFillObject}
+          pointerEvents={normalizedSection === 'bookmarks' ? 'auto' : 'none'}
           accessibilityElementsHidden={normalizedSection !== 'bookmarks'}
           importantForAccessibility={normalizedSection === 'bookmarks' ? 'auto' : 'no-hide-descendants'}
         >
@@ -162,27 +176,24 @@ const ReviewScreen: React.FC = () => {
             onTripFilterToggle={() => setTripFilterActive((v) => !v)}
           />
         </View>
-        <View
-          style={[styles.sectionPanel, { display: normalizedSection === 'tripAlbums' ? 'flex' : 'none' }]}
-          accessibilityElementsHidden={normalizedSection !== 'tripAlbums'}
-          importantForAccessibility={normalizedSection === 'tripAlbums' ? 'auto' : 'no-hide-descendants'}
-        >
+        {/*
+          Stats and TripAlbums use display:none when inactive (renders fresh, no slide).
+          backgroundColor covers the Gallery panel sitting beneath them.
+        */}
+        <View style={[styles.sectionPanel, { display: normalizedSection === 'tripAlbums' ? 'flex' : 'none', backgroundColor: colors.background }]}>
           <TripAlbumsSection
             tripAlbums={tripAlbums}
             entries={displayEntries}
             journals={displayJournals}
             onAlbumPress={handleAlbumPress}
             onCreateAlbumPress={handleCreateAlbumPress}
+            onSuggestTripsPress={handleSuggestTripsPress}
             scrollRef={tripAlbumsScrollRef}
             onScrollReport={reportScrollOffset}
             tabBarVisibilityProgress={visibilityProgress}
           />
         </View>
-        <View
-          style={[styles.sectionPanel, { display: normalizedSection === 'stats' ? 'flex' : 'none' }]}
-          accessibilityElementsHidden={normalizedSection !== 'stats'}
-          importantForAccessibility={normalizedSection === 'stats' ? 'auto' : 'no-hide-descendants'}
-        >
+        <View style={[styles.sectionPanel, { display: normalizedSection === 'stats' ? 'flex' : 'none', backgroundColor: colors.background }]}>
           <DashboardSection
             entries={displayEntries}
             journals={displayJournals}
@@ -206,6 +217,23 @@ const styles = StyleSheet.create({
     paddingTop: 50,
     paddingBottom: SPACING.sm,
     backgroundColor: 'transparent',
+  },
+  settingsRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    paddingHorizontal: SPACING.md,
+    marginBottom: SPACING.xs,
+  },
+  segmentRow: {
+    paddingHorizontal: SPACING.md,
+  },
+  settingsButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   contentContainer: {
     flex: 1,

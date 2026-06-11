@@ -6,8 +6,10 @@ import React, { useState, useEffect } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { useFonts } from 'expo-font';
+import { PermanentMarker_400Regular } from '@expo-google-fonts/permanent-marker';
+import { Caveat_400Regular } from '@expo-google-fonts/caveat';
 import { AppProvider } from './src/context/AppContext';
-import { ProgressProvider } from './src/context/ProgressContext';
 import { ThemeProvider, useTheme } from './src/context/ThemeContext';
 import LoadingScreen from './src/screens/LoadingScreen';
 import DailyAppOpenCountryCapture from './src/components/DailyAppOpenCountryCapture';
@@ -52,14 +54,20 @@ const StatusBarWrapper: React.FC = () => {
 };
 
 export default function App() {
+  const [fontsLoaded, fontError] = useFonts({
+    PermanentMarker_400Regular,
+    Caveat_400Regular,
+  });
+
+  // Show LoadingScreen until fonts are ready or failed — never hang.
+  const fontsReady = fontsLoaded || fontError !== null;
+
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <AppProvider>
         <ThemeProvider>
           <SafeAreaProvider>
-            <ProgressProvider>
-              <AppContent />
-            </ProgressProvider>
+            {fontsReady ? <AppContent /> : <LoadingScreen />}
           </SafeAreaProvider>
         </ThemeProvider>
       </AppProvider>

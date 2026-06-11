@@ -8,9 +8,13 @@
     "ios": "expo run:ios",
     "web": "expo start --web",
     "eas:build:ios": "eas build --platform ios --profile production",
-    "eas:submit:ios": "eas submit --platform ios --latest --profile production"
+    "eas:submit:ios": "eas submit --platform ios --latest --profile production",
+    "eas:build:android": "eas build --platform android --profile production",
+    "eas:submit:android": "eas submit --platform android --latest --profile production"
   },
   "dependencies": {
+    "@expo-google-fonts/caveat": "^0.4.2",
+    "@expo-google-fonts/permanent-marker": "^0.4.0",
     "@react-native-async-storage/async-storage": "^2.2.0",
     "@react-native-community/datetimepicker": "8.4.4",
     "@react-native-community/netinfo": "11.4.1",
@@ -19,6 +23,7 @@
     "@react-navigation/bottom-tabs": "^7.10.0",
     "@react-navigation/native": "^7.1.28",
     "@react-navigation/native-stack": "^7.10.0",
+    "@shopify/flash-list": "2.0.2",
     "@types/pako": "^2.0.4",
     "expo": "~54.0.33",
     "expo-audio": "~1.1.1",
@@ -43,6 +48,7 @@
     "react-native-safe-area-context": "^5.6.2",
     "react-native-screens": "~4.16.0",
     "react-native-svg": "15.12.1",
+    "react-native-view-shot": "4.0.3",
     "react-native-vision-camera": "^4.7.3",
     "react-native-webview": "13.15.0"
   },

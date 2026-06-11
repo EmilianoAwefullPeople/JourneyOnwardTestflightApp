@@ -12,6 +12,7 @@ import { COLORS, DIMENSIONS, FONT_WEIGHTS, FONTS, SPACING } from '../config/cons
 import { logger } from '../utils/logger';
 import { useTheme } from '../context/ThemeContext';
 import BackArrow from '../components/common/icons/BackArrow';
+import { Ionicons } from '@expo/vector-icons';
 
 type JournalDetailRouteProp = RouteProp<RootStackParamList, 'JournalDetail'>;
 type JournalDetailNavigationProp = NativeStackNavigationProp<RootStackParamList>;
@@ -36,6 +37,8 @@ const JournalDetailScreen: React.FC = () => {
   const { width: screenWidth } = useWindowDimensions();
   const scaleFactor = screenWidth / 390;
   const topBarTop = insets.top + (107.07 - 74 + 20) * scaleFactor;
+  const actionButtonTop = (Number.isFinite(insets?.top) ? insets.top : 0) + 20;
+  const menuDropdownTop = (Number.isFinite(insets?.top) ? insets.top : 0) + 56;
 
   // Find journal
   const journal = journals.find(j => j.id === journalId);
@@ -61,7 +64,7 @@ const JournalDetailScreen: React.FC = () => {
           shadowRadius: 4,
           elevation: 8,
         },
-        menuOption: { paddingVertical: 12, paddingHorizontal: 16 },
+        menuOption: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 16, gap: 10 },
         menuOptionText: { fontFamily: FONTS.inter, fontSize: 16, color: colors.textPrimary },
         menuOptionTextDanger: { color: '#DC2626' },
         scrollView: { flex: 1 },
@@ -211,9 +214,9 @@ const JournalDetailScreen: React.FC = () => {
   if (!journal) {
     return (
       <View style={styles.container}>
-        <View style={[styles.header, { paddingTop: topBarTop }]}>
+        <View style={styles.header}>
           <TouchableOpacity
-            style={[styles.backButton, { left: 25 * scaleFactor }]}
+            style={[styles.backButton, { top: actionButtonTop, left: 25 * scaleFactor }]}
             onPress={() => navigation.goBack()}
             activeOpacity={0.7}
             accessibilityRole="button"
@@ -239,9 +242,9 @@ const JournalDetailScreen: React.FC = () => {
 
   return (
     <View style={styles.container}>
-      <View style={[styles.header, { paddingTop: topBarTop }]}>
+      <View style={styles.header}>
         <TouchableOpacity
-          style={[styles.backButton, { left: 25 * scaleFactor }]}
+          style={[styles.backButton, { top: actionButtonTop, left: 25 * scaleFactor }]}
           onPress={() => navigation.goBack()}
           activeOpacity={0.7}
           accessibilityRole="button"
@@ -252,7 +255,7 @@ const JournalDetailScreen: React.FC = () => {
 
         {/* 3-dots menu button */}
         <TouchableOpacity
-          style={[styles.menuButton, { right: 25 * scaleFactor }]}
+          style={[styles.menuButton, { top: actionButtonTop, right: 25 * scaleFactor }]}
           onPress={() => (menuVisible || menuExiting) ? closeMenuAnimated() : setMenuVisible(true)}
           activeOpacity={0.7}
           accessibilityRole="button"
@@ -268,11 +271,13 @@ const JournalDetailScreen: React.FC = () => {
           <TouchableWithoutFeedback onPress={() => closeMenuAnimated()}>
             <View style={StyleSheet.absoluteFill} />
           </TouchableWithoutFeedback>
-          <Animated.View style={[styles.menuDropdown, { top: topBarTop + 40, right: 25 * scaleFactor, transform: [{ scale: menuDropdownScale }] }]} pointerEvents="box-none">
+          <Animated.View style={[styles.menuDropdown, { top: menuDropdownTop, right: 25 * scaleFactor, transform: [{ scale: menuDropdownScale }] }]} pointerEvents="box-none">
             <TouchableOpacity style={styles.menuOption} onPress={handleEdit} accessibilityRole="button" accessibilityLabel="Edit journal" activeOpacity={0.7}>
+              <Ionicons name="settings" size={20} color={colors.textPrimary} />
               <Text style={styles.menuOptionText}>Edit</Text>
             </TouchableOpacity>
             <TouchableOpacity style={styles.menuOption} onPress={handleDelete} accessibilityRole="button" accessibilityLabel="Delete journal" activeOpacity={0.7}>
+              <Ionicons name="trash-outline" size={20} color="#DC2626" />
               <Text style={[styles.menuOptionText, styles.menuOptionTextDanger]}>Delete</Text>
             </TouchableOpacity>
           </Animated.View>

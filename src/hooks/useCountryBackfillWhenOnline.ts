@@ -2,32 +2,31 @@
 // Runs country backfill when online, staggered from weather backfill to reduce overlap.
 
 import { useEffect, useRef } from 'react';
-import { Entry } from '../models/Entry';
 import { runCountryBackfill } from '../services/CountryBackfillService';
 
 const DEBOUNCE_MS = 5500;
 const INITIAL_RUN_DELAY_MS = 7500;
 
-export type UpdateEntryFn = (entry: Entry) => Promise<void>;
-
 /**
  * When connectivity is available, fills persisted `country` on entries missing it.
+ * Calls onDone() once after each successful batch so callers can refresh state.
  * Debounced; avoids overlapping runs.
  */
-export function useCountryBackfillWhenOnline(updateEntry: UpdateEntryFn): void {
+export function useCountryBackfillWhenOnline(onDone?: () => void): void {
   const wasConnectedRef = useRef<boolean | null>(null);
   const inProgressRef = useRef(false);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const updateEntryRef = useRef(updateEntry);
-  updateEntryRef.current = updateEntry;
+  const onDoneRef = useRef(onDone);
+  onDoneRef.current = onDone;
 
   const runBackfill = () => {
     if (inProgressRef.current) return;
     inProgressRef.current = true;
-    runCountryBackfill(updateEntryRef.current)
+    runCountryBackfill()
       .catch(() => {})
       .finally(() => {
         inProgressRef.current = false;
+        onDoneRef.current?.();
       });
   };
 

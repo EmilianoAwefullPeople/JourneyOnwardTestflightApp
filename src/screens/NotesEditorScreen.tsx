@@ -22,13 +22,19 @@ import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { RouteProp } from '@react-navigation/native';
 import { RootStackParamList } from '../navigation/types';
 import { useAppContext } from '../context/AppContext';
-import { useProgress } from '../context/ProgressContext';
 import { logger } from '../utils/logger';
 import { COLORS, DIMENSIONS, FONT_WEIGHTS, FONTS } from '../config/constants';
 import { useTheme } from '../context/ThemeContext';
 import { ANIMATION_CONFIG } from '../utils/animations';
 import { Journal } from '../models/Journal';
 import { generateUUID } from '../utils/uuid';
+
+interface GeocodedAddressWithLocality {
+  city?: string;
+  country?: string;
+  subAdministrativeArea?: string;
+  locality?: string;
+}
 
 type NotesEditorNavigationProp = NativeStackNavigationProp<RootStackParamList, 'NotesEditor'>;
 type NotesEditorRouteProp = RouteProp<RootStackParamList, 'NotesEditor'>;
@@ -41,21 +47,43 @@ const NotesEditorScreen: React.FC = () => {
   const entryId = route.params?.entryId;
   const albumIdFromParams = route.params?.albumId;
   const journalPlaceholderFromRoute = route.params?.journalPlaceholder?.trim();
+  const editEntryDescription = route.params?.editEntryDescription === true;
+  const isCaptionMode = Boolean(editEntryDescription && entryId);
   const { createJournal, updateEntry, entries, activeTripAlbum } = useAppContext();
-  const { record } = useProgress();
   
   const [noteText, setNoteText] = useState<string>('');
+  const [titleText, setTitleText] = useState<string>('');
   const [isKeyboardOpen, setIsKeyboardOpen] = useState<boolean>(false);
   const [keyboardHeight, setKeyboardHeight] = useState<number>(0);
   const notesInputRef = useRef<TextInput>(null);
-  
+  const titleInputRef = useRef<TextInput>(null);
+  /** Baseline `entry.description` when opening caption mode — for dirty check and save visibility. */
+  const captionBaselineRef = useRef<string>('');
+  const titleBaselineRef = useRef<string>('');
+  /** Only seed caption text once when the entry first appears (avoid clobbering after `refreshData`). */
+  const captionSeededRef = useRef(false);
+
   // Animation values
   const saveButtonOpacity = useRef(new Animated.Value(0)).current;
   const screenOpacity = useRef(new Animated.Value(0)).current;
   const contentTranslateY = useRef(new Animated.Value(20)).current;
-  
-  const screenHeight = Dimensions.get('window').height;
-  
+
+  // Seed caption editor from persisted entry (once)
+  useEffect(() => {
+    if (!isCaptionMode || !entryId || captionSeededRef.current) return;
+    const e = entries.find(x => x.id === entryId);
+    if (!e) return;
+    captionSeededRef.current = true;
+    const baseline = e.description ?? '';
+    const titleBaseline = e.title ?? '';
+    captionBaselineRef.current = baseline;
+    titleBaselineRef.current = titleBaseline;
+    setNoteText(baseline);
+    setTitleText(titleBaseline);
+    const showSave = baseline.trim().length > 0 || titleBaseline.trim().length > 0;
+    saveButtonOpacity.setValue(showSave ? 1 : 0);
+  }, [isCaptionMode, entryId, entries]);
+
   // Entrance animation and keyboard listeners
   useEffect(() => {
     // Entrance animation - syncs with HomeScreen expand animation
@@ -124,7 +152,10 @@ const NotesEditorScreen: React.FC = () => {
   };
 
   const handleClose = () => {
-    const hasUnsavedChanges = noteText.trim().length > 0;
+    const baseline = captionBaselineRef.current ?? '';
+    const hasUnsavedChanges = isCaptionMode
+      ? noteText !== baseline || titleText !== (titleBaselineRef.current ?? '')
+      : noteText.trim().length > 0;
     if (hasUnsavedChanges) {
       Alert.alert(
         'Discard changes?',
@@ -143,13 +174,41 @@ const NotesEditorScreen: React.FC = () => {
   };
   
   const handleSave = async () => {
+    if (isCaptionMode) {
+      if (!entryId) return;
+      const entry = entries.find(e => e.id === entryId);
+      if (!entry) {
+        Alert.alert('Error', 'Experience not found.');
+        return;
+      }
+      Keyboard.dismiss();
+      try {
+        await updateEntry({ ...entry, title: titleText.trim(), description: noteText.trim() });
+        titleBaselineRef.current = titleText.trim();
+        captionBaselineRef.current = noteText.trim();
+        // Return straight to CaptureSaved ("Add more details") — immediate goBack is more reliable
+        // than performClose's delayed goBack with transparentModal + async refreshData.
+        if (navigation.canGoBack()) {
+          navigation.goBack();
+        } else if (entryId) {
+          navigation.navigate('CaptureSaved', { entryId });
+        }
+      } catch (error) {
+        logger.error('NotesEditor: save caption failed', error);
+        Alert.alert('Error', 'Could not save caption. Please try again.');
+      }
+      return;
+    }
+
     if (noteText.trim().length === 0) return;
-    
+
     Keyboard.dismiss();
-    
+
     // Get current location
     let latitude: number | undefined;
     let longitude: number | undefined;
+    let city: string | undefined;
+    let country: string | undefined;
     
     try {
       const locationModule = await import('expo-location');
@@ -160,6 +219,21 @@ const NotesEditorScreen: React.FC = () => {
         if (location) {
           latitude = location.coords.latitude;
           longitude = location.coords.longitude;
+
+          // Persist city/country once at save time so feed cards don't need repeated geocoding.
+          try {
+            const [address] = await locationModule.reverseGeocodeAsync({
+              latitude,
+              longitude,
+            });
+            if (address) {
+              const geocoded = address as GeocodedAddressWithLocality;
+              city = (geocoded.city || geocoded.locality || geocoded.subAdministrativeArea || '').trim() || undefined;
+              country = (geocoded.country || '').trim() || undefined;
+            }
+          } catch (geocodeError) {
+            logger.log('Could not reverse geocode journal save location:', geocodeError);
+          }
         }
       }
     } catch (error) {
@@ -171,9 +245,10 @@ const NotesEditorScreen: React.FC = () => {
       id: generateUUID(),
       content: noteText.trim(),
       timestamp: new Date().toISOString(),
-      cycleType: 'end-day',
       latitude,
       longitude,
+      city,
+      country,
       albumId: albumIdFromParams ?? activeTripAlbum?.id,
       ...(entryId != null ? { linkedEntryId: entryId } : {}),
     };
@@ -188,11 +263,6 @@ const NotesEditorScreen: React.FC = () => {
         }
       }
       try {
-        record('first_journal');
-      } catch (_) {
-        // Non-blocking
-      }
-      try {
         navigation.replace('JournalDetail', { journalId: journal.id });
       } catch (navError) {
         logger.warn('NotesEditor: replace to JournalDetail failed, falling back to navigate', navError);
@@ -204,17 +274,29 @@ const NotesEditorScreen: React.FC = () => {
     }
   };
   
-  const handleTextChange = (text: string) => {
-    setNoteText(text);
-    
-    // Show/hide Save button based on text content
-    const hasText = text.trim().length > 0;
+  const triggerSaveVisibility = (newTitle: string, newCaption: string) => {
+    const captionBaseline = captionBaselineRef.current ?? '';
+    const tBaseline = titleBaselineRef.current ?? '';
+    const showSave = isCaptionMode
+      ? newTitle.trim().length > 0 || newCaption.trim().length > 0 ||
+        newTitle !== tBaseline || newCaption !== captionBaseline
+      : newCaption.trim().length > 0;
     Animated.timing(saveButtonOpacity, {
-      toValue: hasText ? 1 : 0,
+      toValue: showSave ? 1 : 0,
       duration: 200,
       easing: ANIMATION_CONFIG.easing.easeOut,
       useNativeDriver: true,
     }).start();
+  };
+
+  const handleTitleChange = (text: string) => {
+    setTitleText(text);
+    triggerSaveVisibility(text, noteText);
+  };
+
+  const handleTextChange = (text: string) => {
+    setNoteText(text);
+    triggerSaveVisibility(titleText, text);
   };
   
   const handleBlurOverlayPress = () => {
@@ -236,13 +318,23 @@ const NotesEditorScreen: React.FC = () => {
         closeButton: { width: 40, height: 40, justifyContent: 'center', alignItems: 'center' },
         closeText: { fontSize: 45, color: colors.textPrimary, fontFamily: FONTS.inter, lineHeight: 45 },
         inputWrapper: { flex: 1, marginTop: 20, marginBottom: 110 },
+        titleInput: {
+          color: colors.textPrimary,
+          fontSize: 20,
+          fontWeight: FONT_WEIGHTS.bold,
+          fontFamily: FONTS.inter,
+          lineHeight: 28,
+          paddingTop: 16,
+          paddingBottom: 8,
+          paddingLeft: 16,
+        },
         textInput: {
           flex: 1,
           color: colors.textPrimary,
           fontSize: 17,
           fontFamily: FONTS.inter,
           lineHeight: 24,
-          paddingTop: 16,
+          paddingTop: 8,
           paddingBottom: 16,
           paddingLeft: 16,
         },
@@ -263,7 +355,13 @@ const NotesEditorScreen: React.FC = () => {
       }),
     [colors, insets.top, insets.bottom]
   );
-  
+
+  const captionBaseline = captionBaselineRef.current ?? '';
+  const saveButtonDisabled = isCaptionMode
+    ? !(titleText.trim().length > 0 || noteText.trim().length > 0 ||
+        titleText !== (titleBaselineRef.current ?? '') || noteText !== captionBaseline)
+    : noteText.trim().length === 0;
+
   return (
     <Animated.View 
       style={[
@@ -293,15 +391,32 @@ const NotesEditorScreen: React.FC = () => {
           {/* Text Input Wrapper - Stops propagation to parent */}
           <TouchableWithoutFeedback>
             <View style={styles.inputWrapper}>
+              {isCaptionMode && (
+                <AppTextInput
+                  ref={titleInputRef}
+                  style={styles.titleInput}
+                  placeholder="Add a title"
+                  placeholderTextColor={colors.textSecondary}
+                  value={titleText}
+                  onChangeText={handleTitleChange}
+                  multiline={false}
+                  autoFocus={false}
+                  returnKeyType="next"
+                  maxLength={100}
+                  onSubmitEditing={() => notesInputRef.current?.focus()}
+                />
+              )}
               <AppTextInput
                 ref={notesInputRef}
                 style={styles.textInput}
                 placeholder={
-                  entryId
-                    ? 'Write About This Experience...'
-                    : journalPlaceholderFromRoute && journalPlaceholderFromRoute.length > 0
-                      ? journalPlaceholderFromRoute
-                      : 'Type and document it here...'
+                  isCaptionMode
+                    ? 'Write a caption...'
+                    : entryId
+                      ? 'Write About This Experience...'
+                      : journalPlaceholderFromRoute && journalPlaceholderFromRoute.length > 0
+                        ? journalPlaceholderFromRoute
+                        : 'Type and document it here...'
                 }
                 placeholderTextColor={colors.textSecondary}
                 value={noteText}
@@ -309,7 +424,7 @@ const NotesEditorScreen: React.FC = () => {
                 multiline
                 autoFocus={false}
                 returnKeyType="done"
-                maxLength={2000}
+                maxLength={isCaptionMode ? 500 : 2000}
                 textAlignVertical="top"
               />
             </View>
@@ -327,11 +442,11 @@ const NotesEditorScreen: React.FC = () => {
             <TouchableOpacity
               style={styles.saveButton}
               onPress={handleSave}
-              disabled={noteText.trim().length === 0}
+              disabled={saveButtonDisabled}
               activeOpacity={0.7}
               accessibilityRole="button"
-              accessibilityLabel="Save journal"
-              accessibilityState={{ disabled: noteText.trim().length === 0 }}
+              accessibilityLabel={isCaptionMode ? 'Save caption' : 'Save journal'}
+              accessibilityState={{ disabled: saveButtonDisabled }}
             >
               <AppText style={styles.saveButtonText}>Save</AppText>
             </TouchableOpacity>

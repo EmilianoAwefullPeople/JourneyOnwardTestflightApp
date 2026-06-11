@@ -1,9 +1,11 @@
 // BookmarksSection (Gallery view)
-// Review screen gallery: most recent at top, optional "Bookmarks" filter
+// Review screen gallery: most recent at top, optional "Bookmarks" filter.
+// Uses FlashList with row-based virtualization so only visible cards are decoded.
 
 import React, { useMemo, useRef, useEffect, useState } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Animated, Dimensions, Easing } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Animated, Dimensions, Easing } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { FlashList, FlashListRef } from '@shopify/flash-list';
 import { Entry } from '../../models/Entry';
 import GradientText from '../common/GradientText';
 import { DIMENSIONS, SPACING, FONT_WEIGHTS } from '../../config/constants';
@@ -14,6 +16,9 @@ import { useTheme } from '../../context/ThemeContext';
 import { EntryPhotoImage } from '../common/EntryPhotoImage';
 
 const CARD_ASPECT_RATIO = 0.85;
+
+// Each FlashList item is a full-width row containing a left and optional right card.
+type RowItem = { left: Entry; right: Entry | null; rowIndex: number };
 
 function safeTimestamp(entry: Entry): number {
   try {
@@ -29,9 +34,8 @@ function safeTimestamp(entry: Entry): number {
 interface BookmarksSectionProps {
   entries: Entry[];
   onEntryPress: (entry: Entry) => void;
-  /** Optional ref for scroll-to-top when Review tab is tapped */
-  scrollRef?: React.RefObject<ScrollView | null>;
-  /** When true, "This Trip" appears on the same row as All / Bookmarks (Review gallery + travel mode). */
+  /** Accepts a ScrollView-typed ref from ReviewScreen; bridged internally to FlashList. */
+  scrollRef?: React.RefObject<any>;
   tripFilterAvailable?: boolean;
   tripFilterActive?: boolean;
   onTripFilterToggle?: () => void;
@@ -52,14 +56,27 @@ const BookmarksSection: React.FC<BookmarksSectionProps> = ({
   const { colors } = useTheme();
   const insets = useSafeAreaInsets();
   const [showOnlyBookmarks, setShowOnlyBookmarks] = useState(false);
-  const internalScrollRef = useRef<ScrollView>(null);
-  const scrollRef = externalScrollRef ?? internalScrollRef;
+  const flashListRef = useRef<FlashListRef<RowItem>>(null);
+
+  // Bridge: write a scrollTo-compatible shim onto the external ref so ReviewScreen
+  // can call ref.current?.scrollTo({ y: 0 }) without knowing about FlashList.
+  useEffect(() => {
+    if (!externalScrollRef) return;
+    externalScrollRef.current = {
+      scrollTo: ({ animated }: { y?: number; animated?: boolean } = {}) => {
+        flashListRef.current?.scrollToOffset({ offset: 0, animated: animated ?? false });
+      },
+    };
+  }, [externalScrollRef]);
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ y: 0, animated: false });
+    flashListRef.current?.scrollToOffset({ offset: 0, animated: false });
   }, [showOnlyBookmarks]);
+
   const cardAnimations = useRef<Map<string, { opacity: Animated.Value; translateY: Animated.Value; scale: Animated.Value }>>(new Map());
-  const previousItemsLengthRef = useRef(0);
+  // null = first render not yet processed; skip stagger on initial mount so existing
+  // entries appear immediately rather than sliding in when the panel becomes visible.
+  const previousItemsLengthRef = useRef<number | null>(null);
 
   const screenWidth = Dimensions.get('window').width;
   const edgePadding = SPACING.md;
@@ -71,9 +88,17 @@ const BookmarksSection: React.FC<BookmarksSectionProps> = ({
     return [...filtered].sort((a, b) => safeTimestamp(b) - safeTimestamp(a));
   }, [entries, showOnlyBookmarks]);
 
-  const leftColumn = useMemo(() => displayList.filter((_, i) => i % 2 === 0), [displayList]);
-  const rightColumn = useMemo(() => displayList.filter((_, i) => i % 2 === 1), [displayList]);
+  // Pair entries into rows for row-based FlashList virtualization.
+  const rows = useMemo<RowItem[]>(() => {
+    const result: RowItem[] = [];
+    for (let i = 0; i < displayList.length; i += 2) {
+      result.push({ left: displayList[i], right: displayList[i + 1] ?? null, rowIndex: i / 2 });
+    }
+    return result;
+  }, [displayList]);
 
+  // Pre-initialise animation values for all entries (including off-screen ones)
+  // so FlashList cells appear correctly when they scroll into the viewport.
   useEffect(() => {
     displayList.forEach((entry) => {
       if (!cardAnimations.current.has(entry.id)) {
@@ -84,11 +109,35 @@ const BookmarksSection: React.FC<BookmarksSectionProps> = ({
         });
       }
     });
+    // Prune animation values for entries no longer in the list (e.g. deleted entries).
+    const currentIds = new Set(displayList.map(e => e.id));
+    for (const key of cardAnimations.current.keys()) {
+      if (!currentIds.has(key)) cardAnimations.current.delete(key);
+    }
   }, [displayList.length]);
 
+  // Stagger-animate only entries that are genuinely new (added after initial mount).
+  // Two early-return cases suppress animation for initial data arrival:
+  //   1. previousLength === null  → first effect run, set baseline and exit
+  //   2. previousLength === 0     → entries loaded asynchronously after mount (common when
+  //      this component is always-rendered via absoluteFillObject and AppContext hasn't
+  //      finished its SQLite load yet). Treat the whole batch as initial state, not captures.
+  // Only animate when the gallery already had content and more arrives (genuine new captures).
   useEffect(() => {
     const currentLength = displayList.length;
     const previousLength = previousItemsLengthRef.current;
+
+    if (previousLength === null) {
+      previousItemsLengthRef.current = currentLength;
+      return;
+    }
+
+    // Entries arrived asynchronously after mount — not a new capture, skip animation.
+    if (previousLength === 0 && currentLength > 0) {
+      previousItemsLengthRef.current = currentLength;
+      return;
+    }
+
     if (currentLength > previousLength) {
       const newItems = displayList.slice(previousLength);
       newItems.forEach((entry, index) => {
@@ -143,7 +192,9 @@ const BookmarksSection: React.FC<BookmarksSectionProps> = ({
     }
   };
 
-  const renderEntryCard = (entry: Entry) => {
+  const renderEntryCard = (entry: Entry, displayIndex: number) => {
+    const priority = displayIndex < 6 ? 'high' : displayIndex < 12 ? 'normal' : 'low';
+
     let anim = cardAnimations.current.get(entry.id);
     if (!anim) {
       anim = {
@@ -182,10 +233,11 @@ const BookmarksSection: React.FC<BookmarksSectionProps> = ({
           <View style={[styles.mediaContainer, { width: cardWidth, height: cardWidth / CARD_ASPECT_RATIO, backgroundColor: colors.surface }]}>
             {entry.mediaType === 'photo' && entry.photoPaths?.length > 0 ? (
               <EntryPhotoImage
-                uri={entry.photoPaths[0]}
+                uri={entry.thumbPaths?.[0] || entry.photoPaths[0]}
                 style={styles.mediaImage}
                 resizeMode="cover"
-                fallbackBackgroundColor={colors.surface}
+                fallbackBackgroundColor={colors.stone600}
+                priority={priority}
               />
             ) : entry.mediaType === 'video' ? (
               <View style={[styles.placeholder, { backgroundColor: colors.surface }]}>
@@ -220,9 +272,22 @@ const BookmarksSection: React.FC<BookmarksSectionProps> = ({
     );
   };
 
-  const emptyMessage = showOnlyBookmarks
-    ? 'No bookmarks yet'
-    : 'No experiences yet';
+  const renderRow = ({ item: row }: { item: RowItem }) => (
+    <View style={styles.row}>
+      <View style={[styles.column, { width: cardWidth + 8 }]}>
+        {renderEntryCard(row.left, row.rowIndex * 2)}
+      </View>
+      {row.right ? (
+        <View style={[styles.column, { width: cardWidth + 8 }]}>
+          {renderEntryCard(row.right, row.rowIndex * 2 + 1)}
+        </View>
+      ) : (
+        <View style={{ width: cardWidth + 8 }} />
+      )}
+    </View>
+  );
+
+  const emptyMessage = showOnlyBookmarks ? 'No bookmarks yet' : 'No experiences yet';
   const emptySubtext = showOnlyBookmarks
     ? 'Bookmark experiences from the home or edit screen to see them here'
     : 'Capture or add experiences to see them in the gallery';
@@ -284,45 +349,41 @@ const BookmarksSection: React.FC<BookmarksSectionProps> = ({
     </View>
   );
 
-  if (displayList.length === 0) {
-    return (
-      <View style={styles.emptyState}>
-        {renderGalleryFilterRow()}
-        <Text style={[styles.emptyStateText, { color: colors.textPrimary }]}>{emptyMessage}</Text>
-        <Text style={[styles.emptyStateSubtext, { color: colors.textSecondary }]}>{emptySubtext}</Text>
-      </View>
-    );
-  }
+  const ListEmptyComponent = () => (
+    <View style={styles.emptyStateInner}>
+      <Text style={[styles.emptyStateText, { color: colors.textPrimary }]}>{emptyMessage}</Text>
+      <Text style={[styles.emptyStateSubtext, { color: colors.textSecondary }]}>{emptySubtext}</Text>
+    </View>
+  );
 
   return (
-    <ScrollView
-      ref={scrollRef}
-      style={styles.scrollView}
+    <FlashList
+      ref={flashListRef}
+      data={rows}
+      renderItem={renderRow}
+      keyExtractor={(item) => `row-${item.rowIndex}`}
+      ListHeaderComponent={renderGalleryFilterRow}
+      ListEmptyComponent={ListEmptyComponent}
       contentContainerStyle={{
         paddingBottom: getEffectiveMainTabInset(insets.bottom, tabBarVisibilityProgress) + SPACING.md,
       }}
-      showsVerticalScrollIndicator={false}
-      accessibilityLabel={showOnlyBookmarks ? 'Gallery, bookmarks only' : 'Gallery, showing all'}
       onScroll={(e) => onScrollReport?.(e.nativeEvent.contentOffset.y)}
       scrollEventThrottle={16}
-    >
-      {renderGalleryFilterRow()}
-      <View style={styles.grid}>
-        <View style={[styles.column, { width: cardWidth + 8 }]}>
-          {leftColumn.map((entry) => renderEntryCard(entry))}
-        </View>
-        <View style={[styles.column, { width: cardWidth + 8 }]}>
-          {rightColumn.map((entry) => renderEntryCard(entry))}
-        </View>
-      </View>
-    </ScrollView>
+      showsVerticalScrollIndicator={false}
+      accessibilityLabel={showOnlyBookmarks ? 'Gallery, bookmarks only' : 'Gallery, showing all'}
+    />
   );
 };
 
 const styles = StyleSheet.create({
-  scrollView: {
-    flex: 1,
+  row: {
+    flexDirection: 'row',
+    width: '100%',
+    paddingHorizontal: SPACING.md,
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
   },
+  column: {},
   filterRow: {
     flexDirection: 'row',
     paddingHorizontal: SPACING.md,
@@ -346,14 +407,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: FONT_WEIGHTS.semibold,
   },
-  grid: {
-    flexDirection: 'row',
-    width: '100%',
-    paddingHorizontal: SPACING.md,
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-  },
-  column: {},
   card: {
     marginBottom: 12,
     backgroundColor: 'transparent',
@@ -394,11 +447,10 @@ const styles = StyleSheet.create({
     marginLeft: 4,
     backgroundColor: 'transparent',
   },
-  emptyState: {
-    flex: 1,
-    justifyContent: 'center',
+  emptyStateInner: {
+    paddingTop: 80,
     alignItems: 'center',
-    padding: SPACING.xxl,
+    paddingHorizontal: SPACING.xxl,
   },
   emptyStateText: {
     ...TEXT_STYLES.entryInput,

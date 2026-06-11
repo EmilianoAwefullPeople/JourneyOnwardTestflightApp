@@ -13,7 +13,7 @@ import { requestMediaLibraryPermission } from './ImportLatestService';
 
 export const ENTRY_MEDIA_REPAIR_STORAGE_KEY = '@awefull_people:entry_media_repair_version';
 /** Bump when repair logic changes so existing installs run again. */
-export const ENTRY_MEDIA_REPAIR_VERSION = '3';
+export const ENTRY_MEDIA_REPAIR_VERSION = '4';
 
 /** AsyncStorage key tracking which build number last ran repair. */
 export const ENTRY_MEDIA_REPAIR_BUILD_KEY = '@awefull_people:entry_repair_build';

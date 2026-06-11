@@ -243,7 +243,7 @@ export function formatTimeOfDay(timestamp: string): string {
 }
 
 /**
- * Time-based greeting for Studio and other screens (hour only, no location/sunset).
+ * Time-based greeting for other screens (hour only, no location/sunset).
  * Midnight–5AM: Good Night | 5AM–noon: Good Morning | noon–5PM: Good Afternoon | 5PM–midnight: Good Evening
  */
 export function getTimeBasedGreeting(): string {

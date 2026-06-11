@@ -19,18 +19,20 @@ interface TripAlbumsSectionProps {
   journals: Journal[];
   onAlbumPress: (album: TripAlbum) => void;
   onCreateAlbumPress: () => void;
+  onSuggestTripsPress: () => void;
   /** Optional ref for scroll-to-top when Review tab is tapped */
   scrollRef?: React.RefObject<ScrollView | null>;
   onScrollReport?: (offsetY: number) => void;
   tabBarVisibilityProgress?: number;
 }
 
-const TripAlbumsSection: React.FC<TripAlbumsSectionProps> = ({ 
-  tripAlbums, 
-  entries, 
-  journals, 
+const TripAlbumsSection: React.FC<TripAlbumsSectionProps> = ({
+  tripAlbums,
+  entries,
+  journals,
   onAlbumPress,
   onCreateAlbumPress,
+  onSuggestTripsPress,
   scrollRef,
   onScrollReport,
   tabBarVisibilityProgress = 1,
@@ -285,6 +287,30 @@ const TripAlbumsSection: React.FC<TripAlbumsSectionProps> = ({
     );
   };
 
+  const renderSuggestTripsTile = () => {
+    return (
+      <TouchableOpacity
+        key="suggest-trips-tile"
+        style={[styles.createCard, { width: cardWidth }]}
+        onPress={onSuggestTripsPress}
+        activeOpacity={0.8}
+        accessibilityRole="button"
+        accessibilityLabel="Find suggested trip albums"
+      >
+        <View style={styles.createPreviewContainer}>
+          <Text style={styles.createPlus}>✦</Text>
+          <Text style={styles.createLabel}>Suggest Trips</Text>
+        </View>
+        <View style={styles.albumInfo}>
+          <Text style={styles.albumName} numberOfLines={1}>
+            Find Trips
+          </Text>
+          <Text style={styles.createSubtext}>Auto-detect</Text>
+        </View>
+      </TouchableOpacity>
+    );
+  };
+
   return (
     <ScrollView
       ref={scrollRef}
@@ -298,6 +324,7 @@ const TripAlbumsSection: React.FC<TripAlbumsSectionProps> = ({
       <View style={styles.grid}>
         {albumsWithPreview.map(renderAlbumCard)}
         {renderCreateAlbumTile()}
+        {renderSuggestTripsTile()}
       </View>
     </ScrollView>
   );

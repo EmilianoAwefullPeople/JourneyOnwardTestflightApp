@@ -15,6 +15,8 @@ interface RecapProgressBarProps {
   activeSegmentDurationMs: number;
   /** Called when the active segment has finished filling (e.g. to auto-advance). */
   onActiveSegmentComplete?: () => void;
+  /** When true the active segment animation is frozen (interactive slides). */
+  paused?: boolean;
 }
 
 const RecapProgressBar: React.FC<RecapProgressBarProps> = ({
@@ -22,13 +24,14 @@ const RecapProgressBar: React.FC<RecapProgressBarProps> = ({
   totalCount,
   activeSegmentDurationMs,
   onActiveSegmentComplete,
+  paused = false,
 }) => {
   const { colors } = useTheme();
   const progress = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
     progress.setValue(0);
-    if (activeSegmentDurationMs <= 0 || totalCount <= 0) return;
+    if (paused || activeSegmentDurationMs <= 0 || totalCount <= 0) return;
 
     const anim = Animated.timing(progress, {
       toValue: 1,
@@ -40,7 +43,7 @@ const RecapProgressBar: React.FC<RecapProgressBarProps> = ({
       if (finished) onActiveSegmentComplete?.();
     });
     return () => anim.stop();
-  }, [currentIndex, activeSegmentDurationMs, totalCount, onActiveSegmentComplete, progress]);
+  }, [currentIndex, activeSegmentDurationMs, totalCount, onActiveSegmentComplete, progress, paused]);
 
   const segments = useMemo(() => Array.from({ length: totalCount }, (_, i) => i), [totalCount]);
 

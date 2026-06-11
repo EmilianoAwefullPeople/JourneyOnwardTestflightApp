@@ -34,7 +34,7 @@ export interface ThemeColors {
   buttonWhite: string;
   buttonGray: string;
   infoTextGray: string;
-  // Journey card (Studio): inverted so it stands out — light card in dark mode, dark card in light mode
+  // Journey card: inverted so it stands out — light card in dark mode, dark card in light mode
   journeyCardBackground: string;
   journeyCardBorder: string;
   journeyCardTextPrimary: string;

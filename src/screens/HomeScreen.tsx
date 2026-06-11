@@ -17,6 +17,7 @@ import {
   Switch,
   Platform,
   type LayoutChangeEvent,
+  type ViewToken,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
@@ -50,6 +51,9 @@ import { EntryPhotoImage } from '../components/common/EntryPhotoImage';
 import type { ThemeColors } from '../config/theme';
 import { buildOrderedFeedItems, type HomeFeedTopRef } from '../utils/homeFeedOrder';
 import LoadingSpinner from '../components/common/LoadingSpinner';
+import { FeedCardPoster } from '../components/feed/FeedCardPoster';
+import { useFeedMediaPriority } from '../hooks/useFeedMediaPriority';
+import { FlashList, FlashListRef } from '@shopify/flash-list';
 
 type HomeScreenNavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
@@ -79,6 +83,80 @@ const HOME_CAPTURE_ROTATING_PROMPTS = [
   'Jot it down...',
 ] as const;
 const HOME_CAPTURE_PROMPT_ROTATE_MS = 30000;
+
+// ---------------------------------------------------------------------------
+// Module-level pure helpers (no component scope deps)
+// ---------------------------------------------------------------------------
+
+const FEED_CARD_MARGIN_BOTTOM = 60;
+const FEED_JOURNAL_CARD_HEIGHT = 300;
+
+function formatFeedCardDate(timestamp: string): string {
+  try {
+    const d = new Date(timestamp);
+    const month = d.toLocaleDateString('en-US', { month: 'short' });
+    return `${month} ${d.getDate()} ${d.getFullYear()}`;
+  } catch {
+    return '';
+  }
+}
+
+function getAspectRatio(entry: Entry, sessionSeed: string): number {
+  const combinedSeed = `${entry.id}-${sessionSeed}`;
+  const seed = combinedSeed.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
+  const randomFactor = (seed % 100) / 100;
+  let aspect: number;
+  if (randomFactor < 0.75) {
+    const r = randomFactor / 0.75;
+    aspect = 0.9 + r * (1.6 - 0.9);
+  } else {
+    const r = (randomFactor - 0.75) / 0.25;
+    aspect = 0.7 + r * (0.95 - 0.7);
+  }
+  const val = Math.min(Math.max(aspect, 0.7), 1.6);
+  return Number.isFinite(val) && val > 0 ? val : 1;
+}
+
+function getFeedAspectRatio(entry: Entry, sessionSeed: string): number {
+  const combinedSeed = `${entry.id}-${sessionSeed}`;
+  const seed = combinedSeed.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
+  const r = (seed % 100) / 100;
+  const val = 1.0 + r * 0.25;
+  return Number.isFinite(val) && val > 0 ? val : 1;
+}
+
+function getFeedCardHeight(item: FeedItem, sessionSeed: string, mapWidth: number): number {
+  if (item.type === 'journal') {
+    return FEED_JOURNAL_CARD_HEIGHT + FEED_CARD_MARGIN_BOTTOM;
+  }
+  const aspect = getFeedAspectRatio(item.data as Entry, sessionSeed);
+  const imgH = mapWidth / (aspect || 1);
+  return Number.isFinite(imgH) && imgH > 0 ? imgH + FEED_CARD_MARGIN_BOTTOM : FEED_JOURNAL_CARD_HEIGHT + FEED_CARD_MARGIN_BOTTOM;
+}
+
+function distributeItemsIntoColumns(items: FeedItem[], cardWidth: number, sessionSeed: string) {
+  const leftColumn: FeedItem[] = [];
+  const rightColumn: FeedItem[] = [];
+  let leftHeight = 0;
+  let rightHeight = 0;
+
+  items.forEach((item) => {
+    const aspectRatio = item.type === 'journal'
+      ? 1.5
+      : getAspectRatio(item.data as Entry, sessionSeed);
+    const estimatedHeight = cardWidth / aspectRatio;
+
+    if (leftHeight <= rightHeight) {
+      leftColumn.push(item);
+      leftHeight += estimatedHeight + 8;
+    } else {
+      rightColumn.push(item);
+      rightHeight += estimatedHeight + 8;
+    }
+  });
+
+  return { leftColumn, rightColumn };
+}
 
 const HomeScreen: React.FC = () => {
   const navigation = useNavigation<HomeScreenNavigationProp>();
@@ -116,6 +194,8 @@ const HomeScreen: React.FC = () => {
   const [sessionSeed, setSessionSeed] = useState<string>(
     () => `${Date.now()}-${Math.random().toString(36).substring(2, 11)}`
   );
+  /** Comma-separated visible row indices for media priority / prefetch (empty → seed 0,1,2 in hook). */
+  const [feedVisibleKey, setFeedVisibleKey] = useState('');
   const [isRefreshing, setIsRefreshing] = useState(false);
   const feedCardBorderStyle = useMemo(
     () => ({
@@ -132,7 +212,11 @@ const HomeScreen: React.FC = () => {
 
   // Opacity for the cards section — fades to 0 while reordering then back to 1,
   // giving a clear "content changed" signal like Instagram's feed refresh.
-  const feedOpacity = useRef(new Animated.Value(1)).current;
+  // Starts at 0 — fades to 1 once on first data arrival (see feedInitialFadeRef effect below).
+  const feedOpacity = useRef(new Animated.Value(0)).current;
+  const feedInitialFadeRef = useRef(false);
+  // Flips to true after 1200ms — switches spinner to empty-state text for accounts with no entries.
+  const [loadTimedOut, setLoadTimedOut] = useState(false);
 
   // Custom pull-to-refresh indicator animation.
   // refreshRevealAnim: 0-1, fades the spinner pill in/out when isRefreshing changes.
@@ -153,8 +237,27 @@ const HomeScreen: React.FC = () => {
   const homeCaptureBottomAnim = useRef(new Animated.Value(initialHomeCaptureShownBottom)).current;
   const captureMorphProgress = useRef(new Animated.Value(hidden ? 1 : 0)).current;
 
-  // Scroll ref for scroll-to-top on Home tab tap
+  // Scroll refs — ScrollView for gallery mode, FlashList for feed mode
   const scrollViewRef = useRef<ScrollView>(null);
+  const flashListRef = useRef<FlashListRef<FeedItem> | null>(null);
+  const feedViewabilityConfig = useRef({ itemVisiblePercentThreshold: 1 });
+  const feedVisibleKeyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onFeedViewableItemsChanged = useRef(
+    (info: { viewableItems: ViewToken<FeedItem>[]; changed: ViewToken<FeedItem>[] }) => {
+      const indices = info.viewableItems
+        .filter((v) => v.isViewable && typeof v.index === 'number' && (v.index as number) >= 0)
+        .map((v) => v.index as number)
+        .sort((a, b) => a - b);
+      if (indices.length === 0) return;
+      const key = indices.join(',');
+      if (feedVisibleKeyTimerRef.current) clearTimeout(feedVisibleKeyTimerRef.current);
+      feedVisibleKeyTimerRef.current = setTimeout(() => {
+        setFeedVisibleKey(key);
+      }, 150);
+    },
+  );
+  // Stable ref to the current scroll-to-top function so tab-press listener never goes stale
+  const scrollToTopRef = useRef<(animated?: boolean) => void>(() => {});
   // Scroll offset for gating long-press until first card reaches top (feed view)
   const scrollOffsetYRef = useRef<number>(0);
   // Header height for feed-mode snap offsets
@@ -229,7 +332,16 @@ const HomeScreen: React.FC = () => {
     };
   }, []);
 
+  // Stable string key encoding entry IDs — prevents geocoding from re-firing on
+  // every refreshData() that returns a new array ref with identical content.
+  const entryIdsKey = useMemo(
+    () => (entries ?? []).map((e) => e.id).join(','),
+    [entries]
+  );
+
   // Load country+city for feed cards: read cache immediately (offline-safe), then geocode missing entries.
+  // Keyed on entryIdsKey (not entries array ref) so a refreshData() that returns identical IDs
+  // does not re-trigger geocoding — only actual additions/removals do.
   useEffect(() => {
     if (feedViewMode !== 'feed') return;
     const allEntries = entries ?? [];
@@ -244,12 +356,13 @@ const HomeScreen: React.FC = () => {
     };
     load();
     return () => { cancelled = true; };
-  }, [feedViewMode, entries]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [feedViewMode, entryIdsKey]);
 
   // Scroll to top when user taps Home tab while on Home (like Instagram/Twitter)
   useEffect(() => {
     const unsubscribe = (navigation as any).addListener('tabPress', () => {
-      scrollViewRef.current?.scrollTo({ y: 0, animated: true });
+      scrollToTopRef.current();
     });
     return unsubscribe;
   }, [navigation]);
@@ -382,9 +495,19 @@ const HomeScreen: React.FC = () => {
     return [...entryItems, ...journalItems];
   }, [entries, journals, tripActive, showAllMemories, activeTripAlbums]);
 
+  const entriesById = useMemo(
+    () => new Map((entries ?? []).map(e => [e.id, e])),
+    [entries]
+  );
+
+  const formattedDateByEntryId = useMemo(
+    () => new Map((entries ?? []).map(e => [e.id, formatFeedCardDate(e.timestamp)])),
+    [entries]
+  );
+
   // Scroll home to top so experience cards are not visible behind capture modals
   const scrollToTopThen = (callback: () => void) => {
-    scrollViewRef.current?.scrollTo({ y: 0, animated: true });
+    scrollToTopRef.current();
     const delay = 80; // Let scroll start before modal opens
     setTimeout(callback, delay);
   };
@@ -454,7 +577,11 @@ const HomeScreen: React.FC = () => {
     }).start(() => {
       // Step 2: change seed while cards are invisible (reorder happens here)
       pendingAvoidTopRef.current = displayedFirstRef.current;
+      resetPrefetch();
+      setFeedVisibleKey('');
       setSessionSeed(`${Date.now()}-${Math.random().toString(36).substring(2, 11)}`);
+      // Reset scroll while cards are invisible so the new shuffle always shows from top
+      scrollToTopRef.current(false);
       // Step 3: fade cards back in with a slight spring feel
       Animated.timing(feedOpacity, {
         toValue: 1,
@@ -486,6 +613,9 @@ const HomeScreen: React.FC = () => {
 
   useLayoutEffect(() => {
     pendingAvoidTopRef.current = null;
+    // Scroll to top synchronously after the new shuffle renders so FlashList's
+    // reconciliation pass can't pull a swapped item back into view.
+    scrollToTopRef.current(false);
   }, [sessionSeed]);
 
   // Initialize animations for existing items on mount
@@ -501,45 +631,67 @@ const HomeScreen: React.FC = () => {
     });
   }, []); // Only run on mount
 
-  // Animate new items when array changes
-  useEffect(() => {
+  // Animate new items when array changes — useLayoutEffect so cardAnimations is
+  // populated before the next render reads it, preventing mid-render Animated.Value creation.
+  useLayoutEffect(() => {
     const items = feedItems ?? [];
     const currentLength = items.length;
     const previousLength = previousEntriesLengthRef.current;
 
     if (currentLength > previousLength) {
-      // New items added - animate them in
-      const newItems = items.slice(previousLength);
-      newItems.forEach((item, index) => {
-        const id = item.type === 'entry' ? item.data.id : item.data.id;
-        const globalIndex = previousLength + index;
-        const opacity = new Animated.Value(0);
-        const translateY = new Animated.Value(15);
-        const scale = new Animated.Value(1);
-        cardAnimations.current.set(id, { opacity, translateY, scale });
+      if (previousLength === 0) {
+        // Initial SQLite load arriving after mount — not new captures.
+        // The render function already set opacity=1 defaults for rendered items;
+        // just pre-populate the map for any not-yet-rendered ones so they don't blink.
+        items.forEach(item => {
+          const id = item.data.id;
+          if (!cardAnimations.current.has(id)) {
+            cardAnimations.current.set(id, {
+              opacity: new Animated.Value(1),
+              translateY: new Animated.Value(0),
+              scale: new Animated.Value(1),
+            });
+          }
+        });
+      } else {
+        // Genuine new items added mid-session (e.g. new capture) — stagger in from opacity 0.
+        const newItems = items.slice(previousLength);
+        newItems.forEach((item, index) => {
+          const id = item.data.id;
+          const globalIndex = previousLength + index;
+          const opacity = new Animated.Value(0);
+          const translateY = new Animated.Value(15);
+          const scale = new Animated.Value(1);
+          cardAnimations.current.set(id, { opacity, translateY, scale });
 
-        // Staggered animation
-        const delay = createStaggeredDelay(globalIndex, 50);
-        Animated.parallel([
-          Animated.timing(opacity, {
-            toValue: 1,
-            duration: ANIMATION_CONFIG.durations.slow,
-            delay,
-            easing: ANIMATION_CONFIG.easing.easeOut,
-            useNativeDriver: true,
-          }),
-          Animated.timing(translateY, {
-            toValue: 0,
-            duration: ANIMATION_CONFIG.durations.slow,
-            delay,
-            easing: ANIMATION_CONFIG.easing.easeOut,
-            useNativeDriver: true,
-          }),
-        ]).start();
-      });
+          const delay = createStaggeredDelay(globalIndex, 50);
+          Animated.parallel([
+            Animated.timing(opacity, {
+              toValue: 1,
+              duration: ANIMATION_CONFIG.durations.slow,
+              delay,
+              easing: ANIMATION_CONFIG.easing.easeOut,
+              useNativeDriver: true,
+            }),
+            Animated.timing(translateY, {
+              toValue: 0,
+              duration: ANIMATION_CONFIG.durations.slow,
+              delay,
+              easing: ANIMATION_CONFIG.easing.easeOut,
+              useNativeDriver: true,
+            }),
+          ]).start();
+        });
+      }
     }
 
     previousEntriesLengthRef.current = currentLength;
+
+    // Prune animation values for items no longer in the feed (e.g. deleted entries).
+    const currentIds = new Set(items.map(item => item.data.id));
+    for (const key of cardAnimations.current.keys()) {
+      if (!currentIds.has(key)) cardAnimations.current.delete(key);
+    }
   }, [feedItems]);
 
   // Dismiss long-press overlay and animate card scale back to 1
@@ -639,47 +791,6 @@ const HomeScreen: React.FC = () => {
     });
   };
 
-  // Get aspect ratio for an entry using session seed (gallery mode)
-  const getAspectRatio = (entry: Entry, sessionSeed: string): number => {
-    const combinedSeed = `${entry.id}-${sessionSeed}`;
-    const seed = combinedSeed.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
-    const randomFactor = (seed % 100) / 100; // 0..1
-    // Bias toward taller/vertical cards:
-    // - 75% of values (0..0.75) map to portrait-ish ratios 0.9–1.6
-    // - 25% of values (0.75..1) map to landscape/square-ish ratios 0.7–0.95
-    let aspect: number;
-    if (randomFactor < 0.75) {
-      const r = randomFactor / 0.75; // 0..1
-      aspect = 0.9 + r * (1.6 - 0.9); // 0.9..1.6
-    } else {
-      const r = (randomFactor - 0.75) / 0.25; // 0..1
-      aspect = 0.7 + r * (0.95 - 0.7); // 0.7..0.95
-    }
-    const val = Math.min(Math.max(aspect, 0.7), 1.6);
-    return Number.isFinite(val) && val > 0 ? val : 1;
-  };
-
-  // Feed mode: aspect ratios 1:1 (square) to 5:4 — never portrait
-  const getFeedAspectRatio = (entry: Entry, sessionSeed: string): number => {
-    const combinedSeed = `${entry.id}-${sessionSeed}`;
-    const seed = combinedSeed.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
-    const r = (seed % 100) / 100; // 0..1
-    const val = 1.0 + r * 0.25; // 1:1 to 5:4
-    return Number.isFinite(val) && val > 0 ? val : 1;
-  };
-
-  // Compute feed card height (for snap offsets) - must match actual rendered layout
-  const FEED_CARD_MARGIN_BOTTOM = 60;
-  const FEED_JOURNAL_CARD_HEIGHT = 300;
-  const getFeedCardHeight = (item: FeedItem, sessionSeed: string): number => {
-    if (item.type === 'journal') {
-      return FEED_JOURNAL_CARD_HEIGHT + FEED_CARD_MARGIN_BOTTOM;
-    }
-    const aspect = getFeedAspectRatio(item.data as Entry, sessionSeed);
-    const imgH = mapWidth / (aspect || 1);
-    return Number.isFinite(imgH) && imgH > 0 ? imgH + FEED_CARD_MARGIN_BOTTOM : FEED_JOURNAL_CARD_HEIGHT + FEED_CARD_MARGIN_BOTTOM;
-  };
-
   // Calculate card width: full width for feed mode, half for gallery
   const cardWidth = feedViewMode === 'feed' ? mapWidth : (mapWidth - 16) / 2;
 
@@ -692,6 +803,26 @@ const HomeScreen: React.FC = () => {
     return buildOrderedFeedItems(items, pendingAvoidTopRef.current, sessionSeed);
   }, [feedItems, sessionSeed]);
 
+  const feedUris = useMemo(
+    () =>
+      (shuffledItems ?? []).map((item) => {
+        if (item.type !== 'entry') return null;
+        const e = item.data;
+        if (e.mediaType === 'photo' && e.photoPaths && e.photoPaths.length > 0) {
+          return e.photoPaths[0];
+        }
+        return null;
+      }),
+    [shuffledItems],
+  );
+
+  const { priorityByUri, resetPrefetch } = useFeedMediaPriority(feedUris, feedVisibleKey);
+
+  const feedListExtraData = useMemo(
+    () => ({ feedVisibleKey, sessionSeed }),
+    [feedVisibleKey, sessionSeed],
+  );
+
   useEffect(() => {
     const first = shuffledItems[0];
     if (first) {
@@ -701,26 +832,79 @@ const HomeScreen: React.FC = () => {
     }
   }, [shuffledItems]);
 
+  // One-shot fade-in: reveal the feed the first time data arrives.
+  // feedOpacity starts at 0; subsequent refreshes manage it via handleRefresh.
+  useEffect(() => {
+    if (!feedInitialFadeRef.current && shuffledItems.length > 0) {
+      feedInitialFadeRef.current = true;
+      Animated.timing(feedOpacity, {
+        toValue: 1,
+        duration: 280,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+    }
+  }, [shuffledItems.length]);
+
+  // Fallback: after 1200ms flip loadTimedOut so the spinner becomes the empty-state text.
+  // State update only — no animation here, to avoid the race where feedOpacity starts
+  // rising before React commits the loadTimedOut=true render (which would show both
+  // the spinner and the feed content simultaneously).
+  useEffect(() => {
+    const timer = setTimeout(() => setLoadTimedOut(true), 1200);
+    return () => clearTimeout(timer);
+  }, []);
+
+  // Start the fallback fade-in only AFTER loadTimedOut=true is committed to the render tree.
+  // This guarantees the spinner is gone (paint complete) before feedOpacity begins rising.
+  useEffect(() => {
+    if (loadTimedOut && !feedInitialFadeRef.current) {
+      feedInitialFadeRef.current = true;
+      Animated.timing(feedOpacity, {
+        toValue: 1,
+        duration: 280,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+    }
+  }, [loadTimedOut]);
+
+  // Pre-computed card heights keyed by item ID — avoids repeating the string-hash
+  // work inside feedSnapOffsets / feedCardScrollOffsets on every layout event.
+  const cardHeightMap = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const item of shuffledItems) {
+      const key = item.type === 'entry' ? item.data.id : `j:${item.data.id}`;
+      map.set(key, getFeedCardHeight(item, sessionSeed, mapWidth));
+    }
+    return map;
+  }, [shuffledItems, sessionSeed, mapWidth]);
+
+  // Two-column distribution for gallery mode — only recomputed when inputs change.
+  const galleryColumns = useMemo(() => {
+    if (feedViewMode !== 'gallery') return null;
+    const galleryCardWidth = (mapWidth - 16) / 2;
+    return distributeItemsIntoColumns(shuffledItems, galleryCardWidth, sessionSeed);
+  }, [feedViewMode, shuffledItems, mapWidth, sessionSeed]);
+
   // Snap offsets for feed mode: card tops align at 17% of viewport height from top
   // Must account for contentContainerStyle paddingTop so offsets match actual content positions
   const feedSnapOffsets = useMemo(() => {
     const items = shuffledItems ?? [];
     if (feedViewMode !== 'feed' || headerHeight <= 0 || heightAboveMemories <= 0 || items.length === 0) return undefined;
     try {
-      // Target height where "Your Memories" and card tops align (pink line - higher on screen)
       const targetY = screenHeight * 0.17;
-      const contentPaddingTop = headerPaddingTop; // Matches feedContent paddingTop
+      const contentPaddingTop = headerPaddingTop;
       const offsets: number[] = [0];
 
-      // First snap: "Your Memories" at targetY (scroll so its top aligns there)
       const memoriesTop = contentPaddingTop + heightAboveMemories;
       const offMemories = Math.max(0, memoriesTop - targetY);
       if (Number.isFinite(offMemories) && offMemories > 10) offsets.push(offMemories);
 
-      // Subsequent snaps: each feed card top at targetY
       let cumulative = contentPaddingTop + headerHeight;
       for (let i = 0; i < items.length; i++) {
-        const cardH = getFeedCardHeight(items[i], sessionSeed);
+        const key = items[i].type === 'entry' ? items[i].data.id : `j:${items[i].data.id}`;
+        const cardH = cardHeightMap.get(key) ?? (FEED_JOURNAL_CARD_HEIGHT + FEED_CARD_MARGIN_BOTTOM);
         if (!Number.isFinite(cardH)) break;
         cumulative += cardH;
         const off = Math.max(0, cumulative - targetY);
@@ -731,7 +915,7 @@ const HomeScreen: React.FC = () => {
     } catch {
       return undefined;
     }
-  }, [feedViewMode, headerHeight, heightAboveMemories, headerPaddingTop, shuffledItems, screenHeight]);
+  }, [feedViewMode, headerHeight, heightAboveMemories, headerPaddingTop, shuffledItems, cardHeightMap, screenHeight]);
 
   // Scroll offset per card index to put that card's top at targetY (for long-press scroll-then-show)
   const feedCardScrollOffsets = useMemo(() => {
@@ -744,7 +928,8 @@ const HomeScreen: React.FC = () => {
       let cumulative = contentPaddingTop + headerHeight;
       for (let i = 0; i < items.length; i++) {
         offsets.push(Math.max(0, cumulative - targetY));
-        const cardH = getFeedCardHeight(items[i], sessionSeed);
+        const key = items[i].type === 'entry' ? items[i].data.id : `j:${items[i].data.id}`;
+        const cardH = cardHeightMap.get(key) ?? (FEED_JOURNAL_CARD_HEIGHT + FEED_CARD_MARGIN_BOTTOM);
         if (!Number.isFinite(cardH)) break;
         cumulative += cardH;
       }
@@ -752,34 +937,7 @@ const HomeScreen: React.FC = () => {
     } catch {
       return undefined;
     }
-  }, [feedViewMode, headerHeight, heightAboveMemories, headerPaddingTop, shuffledItems, screenHeight]);
-
-  // Distribute items into two columns using shortest-column algorithm
-  const distributeItemsIntoColumns = (items: FeedItem[], cardWidth: number, sessionSeed: string) => {
-    const leftColumn: FeedItem[] = [];
-    const rightColumn: FeedItem[] = [];
-    let leftHeight = 0;
-    let rightHeight = 0;
-
-    items.forEach((item) => {
-      // Calculate item height using session seed for randomization
-      const aspectRatio = item.type === 'journal'
-        ? 1.5
-        : getAspectRatio(item.data as Entry, sessionSeed); // Fixed aspect for journals
-      const estimatedHeight = cardWidth / aspectRatio;
-
-      // Add to shorter column
-      if (leftHeight <= rightHeight) {
-        leftColumn.push(item);
-        leftHeight += estimatedHeight + 8; // 8px margin
-      } else {
-        rightColumn.push(item);
-        rightHeight += estimatedHeight + 8;
-      }
-    });
-
-    return { leftColumn, rightColumn };
-  };
+  }, [feedViewMode, headerHeight, heightAboveMemories, headerPaddingTop, shuffledItems, cardHeightMap, screenHeight]);
 
   // Render card function - handles both entries and journals; column only used for gallery entry cards
   const renderCard = (item: FeedItem, sessionSeed: string, column?: 'left' | 'right') => {
@@ -787,16 +945,6 @@ const HomeScreen: React.FC = () => {
       return renderEntryCard(item.data, sessionSeed, column);
     } else {
       return renderJournalCard(item.data, sessionSeed);
-    }
-  };
-
-  const formatFeedCardDate = (timestamp: string): string => {
-    try {
-      const d = new Date(timestamp);
-      const month = d.toLocaleDateString('en-US', { month: 'short' });
-      return `${month} ${d.getDate()} ${d.getFullYear()}`;
-    } catch {
-      return '';
     }
   };
 
@@ -848,8 +996,8 @@ const HomeScreen: React.FC = () => {
           (item) => item.type === 'entry' && item.data.id === entry.id
         );
         const targetY = feedCardScrollOffsets?.[idx];
-        if (scrollViewRef.current && targetY != null && Number.isFinite(targetY)) {
-          scrollViewRef.current.scrollTo({ y: targetY, animated: true });
+        if (flashListRef.current && targetY != null && Number.isFinite(targetY)) {
+          flashListRef.current.scrollToOffset({ offset: targetY, animated: true });
           setTimeout(showLongPress, 350);
         } else {
           showLongPress();
@@ -865,6 +1013,8 @@ const HomeScreen: React.FC = () => {
       const country = (entry.country?.trim() || loc?.country || '').trim();
       const city = loc?.city ?? '';
       const hasPhoto = entry.mediaType === 'photo' && entry.photoPaths && entry.photoPaths.length > 0;
+      const photoUri = hasPhoto ? (entry.thumbPaths?.[0] || entry.photoPaths[0]) : '';
+      const imgPriority = hasPhoto && photoUri ? (priorityByUri.get(entry.photoPaths[0]) ?? 'normal') : 'normal';
 
       return (
         <Animated.View
@@ -897,13 +1047,14 @@ const HomeScreen: React.FC = () => {
             >
               {hasPhoto ? (
                 <EntryPhotoImage
-                  uri={entry.photoPaths[0]}
+                  uri={photoUri}
                   style={styles.feedCardFullImage}
                   resizeMode="cover"
-                  fallbackBackgroundColor={colors.surface}
+                  fallbackBackgroundColor={colors.stone600}
+                  priority={imgPriority}
                 />
               ) : (
-                <View style={[styles.feedCardFullImage, { backgroundColor: colors.surface }]} />
+                <FeedCardPoster mediaType={entry.mediaType} isDark={isDark} />
               )}
 
               <LinearGradient
@@ -925,7 +1076,7 @@ const HomeScreen: React.FC = () => {
 
               <View style={styles.feedCardTopRight} pointerEvents="none">
                 <Text style={styles.feedCardTopRightText} numberOfLines={1} maxFontSizeMultiplier={1.2}>
-                  {formatFeedCardDate(entry.timestamp)}
+                  {formattedDateByEntryId.get(entry.id) ?? ''}
                 </Text>
                 {city.length > 0 && (
                   <Text style={styles.feedCardTopRightText} numberOfLines={1} maxFontSizeMultiplier={1.2}>
@@ -993,10 +1144,11 @@ const HomeScreen: React.FC = () => {
             <View style={[styles.pinterestMediaContainer, { aspectRatio, borderRadius: 16 }]}>
               {entry.mediaType === 'photo' && entry.photoPaths && entry.photoPaths.length > 0 ? (
                 <EntryPhotoImage
-                  uri={entry.photoPaths[0]}
+                  uri={entry.thumbPaths?.[0] || entry.photoPaths[0]}
                   style={[styles.pinterestImage, { borderRadius: 16 }]}
                   resizeMode="cover"
-                  fallbackBackgroundColor={colors.surface}
+                  fallbackBackgroundColor={colors.stone600}
+                  priority={priorityByUri.get(entry.photoPaths[0]) ?? 'normal'}
                 />
               ) : entry.mediaType === 'video' ? (
                 <View style={styles.pinterestVideoPlaceholder}>
@@ -1038,10 +1190,10 @@ const HomeScreen: React.FC = () => {
     const formattedDate = new Date(journal.timestamp).toLocaleDateString('en-US', {
       month: 'long', day: 'numeric', year: 'numeric',
     });
-    const linkedEntry = journal.linkedEntryId ? entries.find((e) => e.id === journal.linkedEntryId) : undefined;
+    const linkedEntry = journal.linkedEntryId ? entriesById.get(journal.linkedEntryId) : undefined;
     const linkedLocation = journal.linkedEntryId ? entryLocations[journal.linkedEntryId] : undefined;
-    const city = (linkedEntry?.city?.trim() || linkedLocation?.city?.trim() || '').trim();
-    const country = (linkedEntry?.country?.trim() || linkedLocation?.country?.trim() || '').trim();
+    const city = (journal.city?.trim() || linkedEntry?.city?.trim() || linkedLocation?.city?.trim() || '').trim();
+    const country = (journal.country?.trim() || linkedEntry?.country?.trim() || linkedLocation?.country?.trim() || '').trim();
     const locationLabel = city && country
       ? `${city}, ${country}`
       : city || country || '';
@@ -1135,289 +1287,541 @@ const HomeScreen: React.FC = () => {
     outputRange: [homeCaptureExpandedWidth, HOME_CAPTURE_COMPACT_WIDTH],
   });
 
+  // Assign scrollToTopRef on every render so the tab-press listener never holds a stale closure.
+  scrollToTopRef.current = (animated = true) => {
+    if (feedViewMode === 'feed') {
+      flashListRef.current?.scrollToOffset({ offset: 0, animated });
+    } else {
+      scrollViewRef.current?.scrollTo({ y: 0, animated });
+    }
+  };
+
+  // visibilityProgress is always hidden ? 0 : 1 — use `hidden` to avoid recomputing
+  // this style on every scroll-driven frame where only intermediate values change.
   const homeFeedContentContainerStyle = useMemo(
     () => [
       styles.feedContent,
       {
         paddingBottom:
-          getEffectiveMainTabInset(insets.bottom, visibilityProgress) +
+          getEffectiveMainTabInset(insets.bottom, hidden ? 0 : 1) +
           SPACING.md +
           homeCapturePillHeight +
           HOME_CAPTURE_FLOAT_GAP,
       },
     ],
-    [styles.feedContent, insets.bottom, homeCapturePillHeight, visibilityProgress]
+    [styles.feedContent, insets.bottom, homeCapturePillHeight, hidden]
   );
   const pullIndicatorTop = Math.max(
     safeTopInset + HOME_PULL_INDICATOR_SAFE_GAP,
     safeTopInset + HOME_PULL_INDICATOR_MIN_TOP_SAFE_SPACE - HOME_PULL_INDICATOR_CONTENT_OFFSET
   );
 
+  // Pre-computed outside the conditional render so TypeScript doesn't narrow feedViewMode
+  // inside each branch, causing always-false comparison warnings.
+  const feedModeSelected = feedViewMode === 'feed';
+  const galleryModeSelected = feedViewMode === 'gallery';
+
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
-      <ScrollView
-        ref={scrollViewRef}
-        style={styles.feed}
-        contentContainerStyle={homeFeedContentContainerStyle}
-        decelerationRate={feedViewMode === 'feed' ? 'fast' : 'normal'}
-        snapToInterval={feedViewMode === 'feed' && !feedSnapOffsets ? screenHeight * 0.85 : undefined}
-        snapToOffsets={feedViewMode === 'feed' ? feedSnapOffsets : undefined}
-        snapToAlignment={feedViewMode === 'feed' ? 'start' : undefined}
-        showsVerticalScrollIndicator={feedViewMode === 'gallery'}
-        scrollEventThrottle={16}
-        onScroll={(e) => {
-          const y = e?.nativeEvent?.contentOffset?.y ?? 0;
-          scrollOffsetYRef.current = y;
-          reportScrollOffset(y);
-        }}
-        onScrollEndDrag={(e) => {
-          const y = e?.nativeEvent?.contentOffset?.y ?? 0;
-          if (!isRefreshing && y <= -PULL_THRESHOLD) {
-            handleRefresh();
-          }
-        }}
-      >
-        <View
-          onLayout={(e) => setHeaderHeight(e.nativeEvent.layout.height)}
-          collapsable={false}
-        >
-          {/* Content above "Your Memories" - measured for first snap point */}
-          <View onLayout={(e) => setHeightAboveMemories(e.nativeEvent.layout.height)} collapsable={false}>
-            {!tripHeaderData && (
+      {feedViewMode === 'feed' ? (
+        /* ── Feed mode: FlashList virtualises cards; header is non-virtual ListHeaderComponent ── */
+        <>
+          {shuffledItems.length === 0 && (
+            <View
+              style={{ ...StyleSheet.absoluteFillObject, justifyContent: 'center', alignItems: 'center', paddingHorizontal: SPACING.xxl }}
+              pointerEvents="none"
+            >
+              {!loadTimedOut ? (
+                <>
+                  <LoadingSpinner size="small" />
+                  <Text
+                    numberOfLines={1}
+                    maxFontSizeMultiplier={1.3}
+                    style={{ fontSize: 13, fontStyle: 'italic', fontWeight: '400', color: colors.textPrimary, opacity: 0.55, marginTop: SPACING.sm }}
+                  >
+                    Preparing your memories...
+                  </Text>
+                </>
+              ) : (
+                <Text style={[styles.placeholderText, { marginTop: 0 }]} maxFontSizeMultiplier={1.3}>
+                  {tripActive && !showAllMemories
+                    ? 'Capture Travel Memories To See Them Here!'
+                    : 'Your Photos And Experiences Will Be Shown Here!'}
+                </Text>
+              )}
+            </View>
+          )}
+          <Animated.View style={[styles.feed, { opacity: feedOpacity }]}>
+          {/* FlashList v2 auto-measures items; no estimatedItemSize (v1-only). */}
+          <FlashList
+            ref={flashListRef}
+            data={shuffledItems}
+            extraData={feedListExtraData}
+            keyExtractor={(item) =>
+              item.type === 'entry' ? `entry-${item.data.id}` : `journal-${item.data.id}`
+            }
+            getItemType={(item) => item.type}
+            drawDistance={screenHeight * 2}
+            viewabilityConfig={feedViewabilityConfig.current}
+            onViewableItemsChanged={onFeedViewableItemsChanged.current}
+            renderItem={({ item }) => renderCard(item, sessionSeed)}
+            ListHeaderComponent={
               <View
-                style={[
-                  styles.travelModeGlassCard,
-                  { borderColor: isDark ? 'rgba(255,255,255,0.14)' : 'rgba(20,18,18,0.1)' },
-                  Platform.OS === 'ios'
-                    ? {
-                      shadowColor: '#000',
-                      shadowOffset: { width: 0, height: 4 },
-                      shadowOpacity: isDark ? 0.32 : 0.1,
-                      shadowRadius: 10,
-                    }
-                    : { elevation: 7 },
-                ]}
+                onLayout={(e) => setHeaderHeight(e.nativeEvent.layout.height)}
+                collapsable={false}
               >
-                {Platform.OS === 'ios' ? (
-                  <BlurView
-                    intensity={isDark ? 48 : 62}
-                    tint={isDark ? 'dark' : 'light'}
-                    style={StyleSheet.absoluteFillObject}
-                  />
-                ) : (
-                  <View
-                    style={[
-                      StyleSheet.absoluteFillObject,
-                      { backgroundColor: isDark ? 'rgba(32,30,30,0.94)' : 'rgba(248,248,248,0.97)' },
-                    ]}
-                  />
-                )}
-                <View
-                  style={[
-                    styles.travelModeGlassTintOverlay,
-                    { backgroundColor: isDark ? 'rgba(12,10,10,0.28)' : 'rgba(255,255,255,0.42)' },
-                  ]}
-                  pointerEvents="none"
-                />
-                <View
-                  style={[
-                    styles.travelModeGlassRow,
-                  ]}
-                >
-                  <View style={styles.travelModeGlassTextBlock}>
-                    <Text
-                      style={[styles.travelModeGlassTitle, { color: colors.textPrimary }]}
-                      maxFontSizeMultiplier={1.3}
+                {/* Content above "Your Memories" - measured for first snap point */}
+                <View onLayout={(e) => setHeightAboveMemories(e.nativeEvent.layout.height)} collapsable={false}>
+                  {!tripHeaderData && (
+                    <View
+                      style={[
+                        styles.travelModeGlassCard,
+                        { borderColor: isDark ? 'rgba(255,255,255,0.14)' : 'rgba(20,18,18,0.1)' },
+                        Platform.OS === 'ios'
+                          ? {
+                            shadowColor: '#000',
+                            shadowOffset: { width: 0, height: 4 },
+                            shadowOpacity: isDark ? 0.32 : 0.1,
+                            shadowRadius: 10,
+                          }
+                          : { elevation: 7 },
+                      ]}
                     >
-                      Travel Mode
+                      {Platform.OS === 'ios' ? (
+                        <BlurView
+                          intensity={isDark ? 48 : 62}
+                          tint={isDark ? 'dark' : 'light'}
+                          style={StyleSheet.absoluteFillObject}
+                        />
+                      ) : (
+                        <View
+                          style={[
+                            StyleSheet.absoluteFillObject,
+                            { backgroundColor: isDark ? 'rgba(32,30,30,0.94)' : 'rgba(248,248,248,0.97)' },
+                          ]}
+                        />
+                      )}
+                      <View
+                        style={[
+                          styles.travelModeGlassTintOverlay,
+                          { backgroundColor: isDark ? 'rgba(12,10,10,0.28)' : 'rgba(255,255,255,0.42)' },
+                        ]}
+                        pointerEvents="none"
+                      />
+                      <View style={[styles.travelModeGlassRow]}>
+                        <View style={styles.travelModeGlassTextBlock}>
+                          <Text
+                            style={[styles.travelModeGlassTitle, { color: colors.textPrimary }]}
+                            maxFontSizeMultiplier={1.3}
+                          >
+                            Travel Mode
+                          </Text>
+                          <Text
+                            style={[styles.travelModeGlassState, { color: colors.textSecondary }]}
+                            maxFontSizeMultiplier={1.3}
+                          >
+                            {travelModeEnabled ? 'On' : 'Off'}
+                          </Text>
+                        </View>
+                        <Switch
+                          value={travelModeEnabled}
+                          onValueChange={handleTravelModeToggle}
+                          trackColor={{ false: isDark ? 'rgba(255,255,255,0.24)' : '#D1D5DB', true: '#34C759' }}
+                          thumbColor={colors.white}
+                          style={styles.travelModeGlassSwitch}
+                          accessibilityLabel={travelModeEnabled ? 'Travel Mode on' : 'Travel Mode off'}
+                          accessibilityState={{ checked: travelModeEnabled }}
+                        />
+                      </View>
+                    </View>
+                  )}
+                  {tripHeaderData ? (
+                    <>
+                      <View
+                        style={[
+                          styles.tripHeaderCard,
+                          {
+                            backgroundColor: isDark ? '#D9D9DE' : 'rgba(248,248,248,0.97)',
+                            borderColor: isDark ? 'rgba(20,18,18,0.18)' : 'rgba(20,18,18,0.1)',
+                          },
+                        ]}
+                      >
+                        <View style={styles.tripHeaderTopRow}>
+                          <View style={styles.tripHeaderTopTextBlock}>
+                            <Text style={[styles.travelModeGlassTitle, { color: isDark ? '#111111' : colors.textPrimary }]} maxFontSizeMultiplier={1.3}>
+                              Travel Mode
+                            </Text>
+                            <Text style={[styles.tripHeaderState, { color: isDark ? 'rgba(17,17,17,0.68)' : colors.textSecondary }]} maxFontSizeMultiplier={1.3}>
+                              On
+                            </Text>
+                          </View>
+                          <Switch
+                            value={travelModeEnabled}
+                            onValueChange={handleTravelModeToggle}
+                            trackColor={{ false: isDark ? 'rgba(20,18,18,0.22)' : '#D1D5DB', true: '#34C759' }}
+                            thumbColor={colors.white}
+                            style={styles.tripHeaderSwitch}
+                            accessibilityLabel={travelModeEnabled ? 'Travel Mode on' : 'Travel Mode off'}
+                            accessibilityState={{ checked: travelModeEnabled }}
+                          />
+                        </View>
+                        <Text
+                          style={[styles.tripHeaderTitle, { color: isDark ? '#111111' : colors.textPrimary }]}
+                          numberOfLines={2}
+                          maxFontSizeMultiplier={1.35}
+                          accessibilityLabel={`Current Trip: ${tripHeaderData.tripNames}`}
+                        >
+                          {`Current Trip: ${tripHeaderData.tripNames}`}
+                        </Text>
+                        <View style={styles.tripHeaderDayRow}>
+                          <Text
+                            style={[styles.tripHeaderDayText, { color: isDark ? 'rgba(17,17,17,0.72)' : colors.textSecondary }]}
+                            numberOfLines={1}
+                            maxFontSizeMultiplier={1.35}
+                            accessibilityLabel={
+                              tripHeaderData.totalDays
+                                ? `Day ${tripHeaderData.dayNumber} of ${tripHeaderData.totalDays}`
+                                : `Day ${tripHeaderData.dayNumber}`
+                            }
+                          >
+                            {tripHeaderData.totalDays
+                              ? `Day ${tripHeaderData.dayNumber} of ${tripHeaderData.totalDays}`
+                              : `Day ${tripHeaderData.dayNumber}`}
+                          </Text>
+                        </View>
+                      </View>
+                    </>
+                  ) : null}
+                  {showHomeMap && (
+                    <InteractiveMap
+                      entries={entries ?? []}
+                      onEntryPress={handleEntryPress}
+                      collapsed={mapCollapsed}
+                      onToggleCollapse={() => setMapCollapsed(!mapCollapsed)}
+                      showEntryPins={false}
+                    />
+                  )}
+                </View>
+                {/* Memories header with view toggle */}
+                <View style={styles.memoriesHeaderRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.memoriesTitle} maxFontSizeMultiplier={1.4} numberOfLines={1}>
+                      {tripActive && !showAllMemories ? 'This Trip\'s Memories' : 'Your Memories'}
                     </Text>
-                    <Text
-                      style={[styles.travelModeGlassState, { color: colors.textSecondary }]}
-                      maxFontSizeMultiplier={1.3}
-                    >
-                      {travelModeEnabled ? 'On' : 'Off'}
-                    </Text>
+                    {tripActive && (
+                      <TouchableOpacity
+                        onPress={() => setShowAllMemories(v => !v)}
+                        accessibilityRole="button"
+                        accessibilityLabel={showAllMemories ? "Show this trip's memories" : 'Show all memories'}
+                        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                      >
+                        <Text style={[styles.locationLabel, { marginTop: 2, color: colors.textSecondary }]} maxFontSizeMultiplier={1.35}>
+                          {showAllMemories ? "Show this trip's memories" : 'Show all memories'}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
                   </View>
-                  <Switch
-                    value={travelModeEnabled}
-                    onValueChange={handleTravelModeToggle}
-                    trackColor={{ false: isDark ? 'rgba(255,255,255,0.24)' : '#D1D5DB', true: '#34C759' }}
-                    thumbColor={colors.white}
-                    style={styles.travelModeGlassSwitch}
-                    accessibilityLabel={travelModeEnabled ? 'Travel Mode on' : 'Travel Mode off'}
-                    accessibilityState={{ checked: travelModeEnabled }}
-                  />
+                  <View style={styles.toggleButtonsRow}>
+                    <TouchableOpacity
+                      style={styles.toggleButton}
+                      onPress={() => setFeedViewMode('gallery')}
+                      accessibilityRole="button"
+                      accessibilityLabel="Gallery view"
+                      accessibilityState={{ selected: galleryModeSelected }}
+                    >
+                      <GridIcon
+                        width={20}
+                        height={20}
+                        color={galleryModeSelected ? colors.textPrimary : colors.textSecondary}
+                      />
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[styles.toggleButton, { marginLeft: 8 }]}
+                      onPress={() => setFeedViewMode('feed')}
+                      accessibilityRole="button"
+                      accessibilityLabel="Feed view"
+                      accessibilityState={{ selected: feedModeSelected }}
+                    >
+                      <FeedIcon
+                        width={20}
+                        height={20}
+                        color={feedModeSelected ? colors.textPrimary : colors.textSecondary}
+                      />
+                    </TouchableOpacity>
+                  </View>
                 </View>
               </View>
-            )}
-            {tripHeaderData ? (
-              /* Trip Header — shown when Travel Mode is on and active albums exist */
-              <>
+            }
+            ListEmptyComponent={null}
+            contentContainerStyle={{
+              paddingHorizontal: SPACING.md,
+              paddingTop: headerPaddingTop,
+              paddingBottom:
+                getEffectiveMainTabInset(insets.bottom, hidden ? 0 : 1) +
+                SPACING.md +
+                homeCapturePillHeight +
+                HOME_CAPTURE_FLOAT_GAP,
+            }}
+            decelerationRate="fast"
+            snapToInterval={!feedSnapOffsets ? screenHeight * 0.85 : undefined}
+            snapToOffsets={feedSnapOffsets}
+            snapToAlignment="start"
+            showsVerticalScrollIndicator={false}
+            scrollEventThrottle={16}
+            onScroll={(e) => {
+              const y = e?.nativeEvent?.contentOffset?.y ?? 0;
+              scrollOffsetYRef.current = y;
+              reportScrollOffset(y);
+            }}
+            onScrollEndDrag={(e) => {
+              const y = e?.nativeEvent?.contentOffset?.y ?? 0;
+              if (!isRefreshing && y <= -PULL_THRESHOLD) {
+                handleRefresh();
+              }
+            }}
+          />
+        </Animated.View>
+        </>
+      ) : (
+        /* ── Gallery mode: non-virtualised two-column masonry ── */
+        <ScrollView
+          ref={scrollViewRef}
+          style={styles.feed}
+          contentContainerStyle={homeFeedContentContainerStyle}
+          decelerationRate="normal"
+          showsVerticalScrollIndicator
+          scrollEventThrottle={16}
+          onScroll={(e) => {
+            const y = e?.nativeEvent?.contentOffset?.y ?? 0;
+            scrollOffsetYRef.current = y;
+            reportScrollOffset(y);
+          }}
+          onScrollEndDrag={(e) => {
+            const y = e?.nativeEvent?.contentOffset?.y ?? 0;
+            if (!isRefreshing && y <= -PULL_THRESHOLD) {
+              handleRefresh();
+            }
+          }}
+        >
+          <View
+            onLayout={(e) => setHeaderHeight(e.nativeEvent.layout.height)}
+            collapsable={false}
+          >
+            {/* Content above "Your Memories" - measured for first snap point */}
+            <View onLayout={(e) => setHeightAboveMemories(e.nativeEvent.layout.height)} collapsable={false}>
+              {!tripHeaderData && (
                 <View
                   style={[
-                    styles.tripHeaderCard,
-                    {
-                      backgroundColor: isDark ? '#D9D9DE' : 'rgba(248,248,248,0.97)',
-                      borderColor: isDark ? 'rgba(20,18,18,0.18)' : 'rgba(20,18,18,0.1)',
-                    },
+                    styles.travelModeGlassCard,
+                    { borderColor: isDark ? 'rgba(255,255,255,0.14)' : 'rgba(20,18,18,0.1)' },
+                    Platform.OS === 'ios'
+                      ? {
+                        shadowColor: '#000',
+                        shadowOffset: { width: 0, height: 4 },
+                        shadowOpacity: isDark ? 0.32 : 0.1,
+                        shadowRadius: 10,
+                      }
+                      : { elevation: 7 },
                   ]}
                 >
-                  <View style={styles.tripHeaderTopRow}>
-                    <View style={styles.tripHeaderTopTextBlock}>
-                      <Text style={[styles.travelModeGlassTitle, { color: isDark ? '#111111' : colors.textPrimary }]} maxFontSizeMultiplier={1.3}>
+                  {Platform.OS === 'ios' ? (
+                    <BlurView
+                      intensity={isDark ? 48 : 62}
+                      tint={isDark ? 'dark' : 'light'}
+                      style={StyleSheet.absoluteFillObject}
+                    />
+                  ) : (
+                    <View
+                      style={[
+                        StyleSheet.absoluteFillObject,
+                        { backgroundColor: isDark ? 'rgba(32,30,30,0.94)' : 'rgba(248,248,248,0.97)' },
+                      ]}
+                    />
+                  )}
+                  <View
+                    style={[
+                      styles.travelModeGlassTintOverlay,
+                      { backgroundColor: isDark ? 'rgba(12,10,10,0.28)' : 'rgba(255,255,255,0.42)' },
+                    ]}
+                    pointerEvents="none"
+                  />
+                  <View style={[styles.travelModeGlassRow]}>
+                    <View style={styles.travelModeGlassTextBlock}>
+                      <Text
+                        style={[styles.travelModeGlassTitle, { color: colors.textPrimary }]}
+                        maxFontSizeMultiplier={1.3}
+                      >
                         Travel Mode
                       </Text>
-                      <Text style={[styles.tripHeaderState, { color: isDark ? 'rgba(17,17,17,0.68)' : colors.textSecondary }]} maxFontSizeMultiplier={1.3}>
-                        On
+                      <Text
+                        style={[styles.travelModeGlassState, { color: colors.textSecondary }]}
+                        maxFontSizeMultiplier={1.3}
+                      >
+                        {travelModeEnabled ? 'On' : 'Off'}
                       </Text>
                     </View>
                     <Switch
                       value={travelModeEnabled}
                       onValueChange={handleTravelModeToggle}
-                      trackColor={{ false: isDark ? 'rgba(20,18,18,0.22)' : '#D1D5DB', true: '#34C759' }}
+                      trackColor={{ false: isDark ? 'rgba(255,255,255,0.24)' : '#D1D5DB', true: '#34C759' }}
                       thumbColor={colors.white}
-                      style={styles.tripHeaderSwitch}
+                      style={styles.travelModeGlassSwitch}
                       accessibilityLabel={travelModeEnabled ? 'Travel Mode on' : 'Travel Mode off'}
                       accessibilityState={{ checked: travelModeEnabled }}
                     />
                   </View>
-                  <Text
-                    style={[styles.tripHeaderTitle, { color: isDark ? '#111111' : colors.textPrimary }]}
-                    numberOfLines={2}
-                    maxFontSizeMultiplier={1.35}
-                    accessibilityLabel={`Current Trip: ${tripHeaderData.tripNames}`}
-                  >
-                    {`Current Trip: ${tripHeaderData.tripNames}`}
-                  </Text>
-                  <View style={styles.tripHeaderDayRow}>
-                    <Text
-                      style={[styles.tripHeaderDayText, { color: isDark ? 'rgba(17,17,17,0.72)' : colors.textSecondary }]}
-                      numberOfLines={1}
-                      maxFontSizeMultiplier={1.35}
-                      accessibilityLabel={
-                        tripHeaderData.totalDays
-                          ? `Day ${tripHeaderData.dayNumber} of ${tripHeaderData.totalDays}`
-                          : `Day ${tripHeaderData.dayNumber}`
-                      }
-                    >
-                      {tripHeaderData.totalDays
-                        ? `Day ${tripHeaderData.dayNumber} of ${tripHeaderData.totalDays}`
-                        : `Day ${tripHeaderData.dayNumber}`}
-                    </Text>
-                  </View>
                 </View>
-              </>
-            ) : null}
-
-            {/* Interactive Map - conditionally shown based on settings */}
-            {showHomeMap && (
-              <InteractiveMap
-                entries={entries ?? []}
-                onEntryPress={handleEntryPress}
-                collapsed={mapCollapsed}
-                onToggleCollapse={() => setMapCollapsed(!mapCollapsed)}
-                showEntryPins={false}
-              />
-            )}
-          </View>
-
-          {/* Memories header with view toggle */}
-          <View style={styles.memoriesHeaderRow}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.memoriesTitle} maxFontSizeMultiplier={1.4} numberOfLines={1}>
-                {tripActive && !showAllMemories ? 'This Trip\'s Memories' : 'Your Memories'}
-              </Text>
-              {tripActive && (
-                <TouchableOpacity
-                  onPress={() => setShowAllMemories(v => !v)}
-                  accessibilityRole="button"
-                  accessibilityLabel={showAllMemories ? "Show this trip's memories" : 'Show all memories'}
-                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                >
-                  <Text style={[styles.locationLabel, { marginTop: 2, color: colors.textSecondary }]} maxFontSizeMultiplier={1.35}>
-                    {showAllMemories ? "Show this trip's memories" : 'Show all memories'}
-                  </Text>
-                </TouchableOpacity>
+              )}
+              {tripHeaderData ? (
+                <>
+                  <View
+                    style={[
+                      styles.tripHeaderCard,
+                      {
+                        backgroundColor: isDark ? '#D9D9DE' : 'rgba(248,248,248,0.97)',
+                        borderColor: isDark ? 'rgba(20,18,18,0.18)' : 'rgba(20,18,18,0.1)',
+                      },
+                    ]}
+                  >
+                    <View style={styles.tripHeaderTopRow}>
+                      <View style={styles.tripHeaderTopTextBlock}>
+                        <Text style={[styles.travelModeGlassTitle, { color: isDark ? '#111111' : colors.textPrimary }]} maxFontSizeMultiplier={1.3}>
+                          Travel Mode
+                        </Text>
+                        <Text style={[styles.tripHeaderState, { color: isDark ? 'rgba(17,17,17,0.68)' : colors.textSecondary }]} maxFontSizeMultiplier={1.3}>
+                          On
+                        </Text>
+                      </View>
+                      <Switch
+                        value={travelModeEnabled}
+                        onValueChange={handleTravelModeToggle}
+                        trackColor={{ false: isDark ? 'rgba(20,18,18,0.22)' : '#D1D5DB', true: '#34C759' }}
+                        thumbColor={colors.white}
+                        style={styles.tripHeaderSwitch}
+                        accessibilityLabel={travelModeEnabled ? 'Travel Mode on' : 'Travel Mode off'}
+                        accessibilityState={{ checked: travelModeEnabled }}
+                      />
+                    </View>
+                    <Text
+                      style={[styles.tripHeaderTitle, { color: isDark ? '#111111' : colors.textPrimary }]}
+                      numberOfLines={2}
+                      maxFontSizeMultiplier={1.35}
+                      accessibilityLabel={`Current Trip: ${tripHeaderData.tripNames}`}
+                    >
+                      {`Current Trip: ${tripHeaderData.tripNames}`}
+                    </Text>
+                    <View style={styles.tripHeaderDayRow}>
+                      <Text
+                        style={[styles.tripHeaderDayText, { color: isDark ? 'rgba(17,17,17,0.72)' : colors.textSecondary }]}
+                        numberOfLines={1}
+                        maxFontSizeMultiplier={1.35}
+                        accessibilityLabel={
+                          tripHeaderData.totalDays
+                            ? `Day ${tripHeaderData.dayNumber} of ${tripHeaderData.totalDays}`
+                            : `Day ${tripHeaderData.dayNumber}`
+                        }
+                      >
+                        {tripHeaderData.totalDays
+                          ? `Day ${tripHeaderData.dayNumber} of ${tripHeaderData.totalDays}`
+                          : `Day ${tripHeaderData.dayNumber}`}
+                      </Text>
+                    </View>
+                  </View>
+                </>
+              ) : null}
+              {showHomeMap && (
+                <InteractiveMap
+                  entries={entries ?? []}
+                  onEntryPress={handleEntryPress}
+                  collapsed={mapCollapsed}
+                  onToggleCollapse={() => setMapCollapsed(!mapCollapsed)}
+                  showEntryPins={false}
+                />
               )}
             </View>
-            <View style={styles.toggleButtonsRow}>
-              <TouchableOpacity
-                style={styles.toggleButton}
-                onPress={() => setFeedViewMode('gallery')}
-                accessibilityRole="button"
-                accessibilityLabel="Gallery view"
-                accessibilityState={{ selected: feedViewMode === 'gallery' }}
-              >
-                <GridIcon
-                  width={20}
-                  height={20}
-                  color={feedViewMode === 'gallery' ? colors.textPrimary : colors.textSecondary}
-                />
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.toggleButton, { marginLeft: 8 }]}
-                onPress={() => setFeedViewMode('feed')}
-                accessibilityRole="button"
-                accessibilityLabel="Feed view"
-                accessibilityState={{ selected: feedViewMode === 'feed' }}
-              >
-                <FeedIcon
-                  width={20}
-                  height={20}
-                  color={feedViewMode === 'feed' ? colors.textPrimary : colors.textSecondary}
-                />
-              </TouchableOpacity>
+            {/* Memories header with view toggle */}
+            <View style={styles.memoriesHeaderRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.memoriesTitle} maxFontSizeMultiplier={1.4} numberOfLines={1}>
+                  {tripActive && !showAllMemories ? 'This Trip\'s Memories' : 'Your Memories'}
+                </Text>
+                {tripActive && (
+                  <TouchableOpacity
+                    onPress={() => setShowAllMemories(v => !v)}
+                    accessibilityRole="button"
+                    accessibilityLabel={showAllMemories ? "Show this trip's memories" : 'Show all memories'}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  >
+                    <Text style={[styles.locationLabel, { marginTop: 2, color: colors.textSecondary }]} maxFontSizeMultiplier={1.35}>
+                      {showAllMemories ? "Show this trip's memories" : 'Show all memories'}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+              <View style={styles.toggleButtonsRow}>
+                <TouchableOpacity
+                  style={styles.toggleButton}
+                  onPress={() => setFeedViewMode('gallery')}
+                  accessibilityRole="button"
+                  accessibilityLabel="Gallery view"
+                  accessibilityState={{ selected: galleryModeSelected }}
+                >
+                  <GridIcon
+                    width={20}
+                    height={20}
+                    color={galleryModeSelected ? colors.textPrimary : colors.textSecondary}
+                  />
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.toggleButton, { marginLeft: 8 }]}
+                  onPress={() => setFeedViewMode('feed')}
+                  accessibilityRole="button"
+                  accessibilityLabel="Feed view"
+                  accessibilityState={{ selected: feedModeSelected }}
+                >
+                  <FeedIcon
+                    width={20}
+                    height={20}
+                    color={feedModeSelected ? colors.textPrimary : colors.textSecondary}
+                  />
+                </TouchableOpacity>
+              </View>
             </View>
           </View>
-        </View>
 
-        {/* Placeholder or Pinterest-Style Feed Grid / Instagram Feed */}
-        <Animated.View style={{ opacity: feedOpacity }}>
-          {(feedItems ?? []).length === 0 ? (
-            <Text style={styles.placeholderText} maxFontSizeMultiplier={1.3}>
-              {tripActive && !showAllMemories
-                ? 'Capture Travel Memories To See Them Here!'
-                : 'Your Photos And Experiences Will Be Shown Here!'}
-            </Text>
-          ) : (() => {
-            const galleryCardWidth = (mapWidth - 16) / 2;
-
-            if (feedViewMode === 'feed') {
-              // Instagram-like single-column layout
-              const items = shuffledItems ?? [];
+          {/* Gallery cards */}
+          <Animated.View style={{ opacity: feedOpacity }}>
+            {(feedItems ?? []).length === 0 ? (
+              <Text style={styles.placeholderText} maxFontSizeMultiplier={1.3}>
+                {tripActive && !showAllMemories
+                  ? 'Capture Travel Memories To See Them Here!'
+                  : 'Your Photos And Experiences Will Be Shown Here!'}
+              </Text>
+            ) : (() => {
+              const galleryCardWidth = (mapWidth - 16) / 2;
+              const { leftColumn, rightColumn } = galleryColumns ?? { leftColumn: [], rightColumn: [] };
               return (
-                <View style={styles.feedColumn}>
-                  {items.map((item) => {
-                    const key = item.type === 'entry' ? `entry-${item.data.id}` : `journal-${item.data.id}`;
-                    return <React.Fragment key={key}>{renderCard(item, sessionSeed)}</React.Fragment>;
-                  })}
+                <View style={styles.pinterestGrid}>
+                  <View style={styles.pinterestColumnsContainer}>
+                    <View style={[styles.pinterestColumn, { width: galleryCardWidth + 8 }]}>
+                      {leftColumn.map((item) => {
+                        const key = item.type === 'entry' ? `entry-${item.data.id}` : `journal-${item.data.id}`;
+                        return <React.Fragment key={key}>{renderCard(item, sessionSeed, 'left')}</React.Fragment>;
+                      })}
+                    </View>
+                    <View style={[styles.pinterestColumn, { width: galleryCardWidth + 8 }]}>
+                      {rightColumn.map((item) => {
+                        const key = item.type === 'entry' ? `entry-${item.data.id}` : `journal-${item.data.id}`;
+                        return <React.Fragment key={key}>{renderCard(item, sessionSeed, 'right')}</React.Fragment>;
+                      })}
+                    </View>
+                  </View>
                 </View>
               );
-            }
-
-            // Pinterest-style two-column gallery (pass column so long-press icons sit outside card)
-            const { leftColumn, rightColumn } = distributeItemsIntoColumns(shuffledItems ?? [], galleryCardWidth, sessionSeed);
-            return (
-              <View style={styles.pinterestGrid}>
-                <View style={styles.pinterestColumnsContainer}>
-                  <View style={[styles.pinterestColumn, { width: galleryCardWidth + 8 }]}>
-                    {leftColumn.map((item) => {
-                      const key = item.type === 'entry' ? `entry-${item.data.id}` : `journal-${item.data.id}`;
-                      return <React.Fragment key={key}>{renderCard(item, sessionSeed, 'left')}</React.Fragment>;
-                    })}
-                  </View>
-                  <View style={[styles.pinterestColumn, { width: galleryCardWidth + 8 }]}>
-                    {rightColumn.map((item) => {
-                      const key = item.type === 'entry' ? `entry-${item.data.id}` : `journal-${item.data.id}`;
-                      return <React.Fragment key={key}>{renderCard(item, sessionSeed, 'right')}</React.Fragment>;
-                    })}
-                  </View>
-                </View>
-              </View>
-            );
-          })()}
-        </Animated.View>
-      </ScrollView>
+            })()}
+          </Animated.View>
+        </ScrollView>
+      )}
 
       {/* Custom pull-to-refresh indicator — sits below the camera safe area, always on top of content */}
       <Animated.View

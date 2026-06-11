@@ -24,7 +24,7 @@ export interface SuggestedExperience {
 }
 
 /** Time window for one "moment" in ms (30 min). */
-const TIME_WINDOW_MS = 30 * 60 * 1000;
+export const TIME_WINDOW_MS = 30 * 60 * 1000;
 
 /** Same-place threshold in meters. */
 const PLACE_THRESHOLD_M = 150;

@@ -107,6 +107,12 @@ const PinterestGrid: React.FC<PinterestGridProps> = ({ entries, onEntryPress }) 
   //   - To match mapWidth: cardWidth = (mapWidth - 16) / 2
   const cardWidth = (mapWidth - 16) / 2;
 
+  const entryIndexMap = useMemo(() => {
+    const map = new Map<string, number>();
+    entries.forEach((e, i) => map.set(e.id, i));
+    return map;
+  }, [entries]);
+
   // Distribute entries into two columns using shortest-column algorithm
   const distributeEntriesIntoColumns = (entries: Entry[], cardWidth: number) => {
     const leftColumn: Entry[] = [];
@@ -139,8 +145,9 @@ const PinterestGrid: React.FC<PinterestGridProps> = ({ entries, onEntryPress }) 
 
   // Render card function (extracted from renderItem)
   const renderCard = (entry: Entry) => {
-    // Generate consistent random height for each entry based on its ID
-    // This ensures the same entry always has the same height (Pinterest-style)
+    const entryIndex = entryIndexMap.get(entry.id) ?? 0;
+    const priority = entryIndex < 6 ? 'high' : entryIndex < 12 ? 'normal' : 'low';
+
     const seed = entry.id.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
     const randomFactor = (seed % 100) / 100; // 0 to 1
     // Vary aspect ratio from 0.75 (wide/square-ish) to 1.65 (tall portrait) for more noticeable height variation
@@ -163,10 +170,11 @@ const PinterestGrid: React.FC<PinterestGridProps> = ({ entries, onEntryPress }) 
 
           {entry.mediaType === 'photo' && entry.photoPaths && entry.photoPaths.length > 0 ? (
             <EntryPhotoImage
-              uri={entry.photoPaths[0]}
+              uri={entry.thumbPaths?.[0] || entry.photoPaths[0]}
               style={styles.pinterestImage}
               resizeMode="cover"
-              fallbackBackgroundColor={colors.surface}
+              fallbackBackgroundColor={colors.stone600}
+              priority={priority}
             />
           ) : entry.mediaType === 'video' ? (
             <View style={styles.pinterestVideoPlaceholder}>

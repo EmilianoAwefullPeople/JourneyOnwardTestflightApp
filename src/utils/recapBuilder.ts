@@ -1,200 +1,275 @@
-// recapBuilder
-// Builds the ordered sequence of RecapSlides from a RecapCandidate and its entries.
-
 import { Entry } from '../models/Entry';
-import type { RecapCandidate, RecapSlide } from '../models/Recap';
+import { Journal } from '../models/Journal';
 import type {
-  RecapSlideTitlePayload,
-  RecapSlideStatPayload,
-  RecapSlideHighlightPayload,
-  RecapSlideCollagePayload,
-  RecapSlideOutroPayload,
+  RecapCandidate,
+  RecapSlide,
+  RecapSlideType,
+  OpeningScreenPayload,
+  TitleCardPayload,
+  OpeningStatsPayload,
+  BeginningPhotosPayload,
+  ActivityMultipleChoicePayload,
+  ActivityDistributionPayload,
+  ColorPalettePayload,
+  ColorPalettePhotoPayload,
+  EmotionDataPayload,
+  JournalDataPayload,
+  LocationDataPayload,
+  GraphicLocationDataPayload,
+  MiddlePhotosPayload,
+  WeatherDataPayload,
+  TemperatureDataPayload,
+  AltitudeDataPayload,
+  EndPhotosPayload,
+  PostcardItem,
 } from '../models/Recap';
+import {
+  getPhotoUri,
+  getEntriesWithPhotos,
+  selectFromPercentile,
+  extractTripColors,
+  getDistinctLocations,
+  aggregateWeather,
+  aggregateEmotions,
+  computeTripDays,
+  formatDateRange,
+  computePhotosCount,
+  computeJournalStats,
+  getLocationsByFrequency,
+  getEntryLocationLabel,
+  computeActivityChoiceData,
+  computeActivityDistribution,
+  selectLowSaturationPhotoEntry,
+  findClosestToAvgTempEntry,
+  findAltitudeExtremes,
+} from './recapUtils';
 
-const TITLE_DURATION_MS = 6000;
-const STAT_DURATION_MS = 5000;
-const HIGHLIGHT_DURATION_MS = 6000;
-const COLLAGE_DURATION_MS = 7000;
-const OUTRO_DURATION_MS = 5000;
-
-const MAX_HIGHLIGHT_SLIDES = 5;
-const COLLAGE_IMAGE_COUNT = 4;
-const OUTRO_DISPLAY_NAME_MAX_LEN = 40;
-const OUTRO_DISPLAY_NAME_FALLBACK = 'journey';
-
-/**
- * Get first usable media URI for an entry (photoPaths then mediaPaths, same as TripAlbumsSection).
- */
-function getEntryMediaUri(entry: Entry): string | null {
-  const paths = (entry.photoPaths?.length ? entry.photoPaths : entry.mediaPaths) ?? [];
-  const uri = paths.find((p) => p && typeof p === 'string');
-  return uri ?? null;
+function toPostcardItem(entry: Entry): PostcardItem {
+  return {
+    photoUri: getPhotoUri(entry)!,
+    location: getEntryLocationLabel(entry),
+  };
 }
 
-/**
- * Entries that have at least one photo/media URI.
- */
-function entriesWithMedia(entries: Entry[]): Entry[] {
-  return entries.filter((e) => getEntryMediaUri(e) != null);
-}
-
-/**
- * Pick up to maxCount highlight entries: prefer isAwe, then spread over trip order.
- */
-function pickHighlightEntries(entries: Entry[], maxCount: number): Entry[] {
-  const withMedia = entriesWithMedia(entries);
-  if (withMedia.length === 0) return [];
-  if (withMedia.length <= maxCount) return withMedia;
-
-  const awe = withMedia.filter((e) => e.isAwe === true);
-  const rest = withMedia.filter((e) => !e.isAwe);
-  const pool = [...awe, ...rest];
-
-  if (pool.length <= maxCount) return pool;
-
-  const step = Math.max(1, Math.floor(pool.length / maxCount));
-  const indices: number[] = [];
-  for (let i = 0; i < maxCount; i++) {
-    const idx = Math.min(i * step, pool.length - 1);
-    if (!indices.includes(idx)) indices.push(idx);
-  }
-  indices.sort((a, b) => a - b);
-  const seen = new Set<number>();
-  const result: Entry[] = [];
-  for (const i of indices) {
-    if (!seen.has(i)) {
-      seen.add(i);
-      result.push(pool[i]);
-    }
-  }
-  while (result.length < maxCount && result.length < pool.length) {
-    for (let j = 0; j < pool.length && result.length < maxCount; j++) {
-      if (!result.includes(pool[j])) result.push(pool[j]);
-    }
-    break;
-  }
-  return result.slice(0, maxCount);
-}
-
-/**
- * Truncate display name for outro message; use fallback when empty or whitespace.
- */
-function truncateDisplayNameForOutro(name: string): string {
-  const trimmed = (name ?? '').trim();
-  if (trimmed.length === 0) return OUTRO_DISPLAY_NAME_FALLBACK;
-  if (trimmed.length <= OUTRO_DISPLAY_NAME_MAX_LEN) return trimmed;
-  return trimmed.slice(0, OUTRO_DISPLAY_NAME_MAX_LEN).trim() + '…';
-}
-
-/**
- * Pick up to maxCount entries for collage (with media), spread over trip.
- */
-function pickCollageEntries(entries: Entry[], maxCount: number): Entry[] {
-  const withMedia = entriesWithMedia(entries);
-  if (withMedia.length === 0) return [];
-  if (withMedia.length <= maxCount) return withMedia;
-  const step = Math.floor(withMedia.length / maxCount);
-  const result: Entry[] = [];
-  for (let i = 0; i < maxCount; i++) {
-    result.push(withMedia[Math.min(i * step, withMedia.length - 1)]);
-  }
-  return result;
-}
-
-/**
- * Build the ordered recap slides for a candidate and its entries.
- * Title → stats → highlights → optional collage → outro.
- */
-export function buildRecapSlides(candidate: RecapCandidate, entries: Entry[]): RecapSlide[] {
-  const slides: RecapSlide[] = [];
+export function buildRecapSlides(
+  candidate: RecapCandidate,
+  entries: Entry[],
+  journals: Journal[]
+): RecapSlide[] {
   const album = candidate.album;
-  const orderedEntries = candidate.entryIds
-    .map((id) => entries.find((e) => e.id === id))
-    .filter((e): e is Entry => e != null);
 
+  const nonDraft = entries
+    .filter((e) => e.albumId === album.id && !e.isDraft)
+    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+  if (nonDraft.length === 0) return [];
+
+  const withPhotos = getEntriesWithPhotos(nonDraft);
+  const albumJournals = journals.filter((j) => j.albumId === album.id);
+  const startDate = album.startDate;
+  const endDate = album.endDate ?? album.startDate;
+  const tripDays = computeTripDays(startDate, endDate);
+  const dateRangeStr = formatDateRange(startDate, album.endDate);
+  const allColors = extractTripColors(nonDraft);
+  const locations = getDistinctLocations(nonDraft);
+  const weatherAgg = aggregateWeather(nonDraft);
+  const emotionAgg = aggregateEmotions(nonDraft);
+  const locationsByFreq = getLocationsByFrequency(nonDraft);
+
+  const slides: RecapSlide[] = [];
   let slideIndex = 0;
   const nextId = () => `recap-${candidate.id}-${slideIndex++}`;
 
-  const endDateDisplay = album.endDate ?? album.startDate;
-
-  slides.push({
-    id: nextId(),
-    type: 'title',
-    durationMs: TITLE_DURATION_MS,
-    payload: {
-      displayName: candidate.displayName,
-      startDate: album.startDate,
-      endDate: endDateDisplay,
-      subtitle: 'Your journey',
-    } as RecapSlideTitlePayload,
-  });
-
-  const experienceCount = orderedEntries.length;
-  slides.push({
-    id: nextId(),
-    type: 'stat',
-    durationMs: STAT_DURATION_MS,
-    payload: {
-      value: experienceCount,
-      label: experienceCount === 1 ? 'Experience' : 'Experiences',
-      prefix: 'You captured',
-    } as RecapSlideStatPayload,
-  });
-
-  const aweCount = orderedEntries.filter((e) => e.isAwe === true).length;
-  if (aweCount > 0) {
-    slides.push({
-      id: nextId(),
-      type: 'stat',
-      durationMs: STAT_DURATION_MS,
-      payload: {
-        value: aweCount,
-        label: aweCount === 1 ? 'Awe moment' : 'Awe moments',
-        prefix: 'You had',
-      } as RecapSlideStatPayload,
-    });
+  function push(
+    type: RecapSlideType,
+    durationMs: number,
+    payload: RecapSlide['payload'],
+    interactive?: boolean
+  ) {
+    slides.push({ id: nextId(), type, durationMs, payload, interactive });
   }
 
-  const highlightEntries = pickHighlightEntries(orderedEntries, MAX_HIGHLIGHT_SLIDES);
-  for (const entry of highlightEntries) {
-    const uri = getEntryMediaUri(entry);
-    if (!uri) continue;
-    slides.push({
-      id: nextId(),
-      type: 'highlight',
-      durationMs: HIGHLIGHT_DURATION_MS,
-      payload: {
-        entryId: entry.id,
-        mediaUri: uri,
-        caption: entry.title ?? (entry.description ? entry.description.slice(0, 80) : undefined),
-      } as RecapSlideHighlightPayload,
-    });
+  // ── ACT I ──────────────────────────────────────────────────────────────────
+
+  // opening_screen — up to 6 photos, isAwe-prioritized, whole trip
+  const openingPool = selectFromPercentile(nonDraft, 0, 1, 6, true);
+  if (openingPool.length > 0) {
+    push('opening_screen', openingPool.length * 1000, {
+      postcards: openingPool.map(toPostcardItem),
+    } as OpeningScreenPayload);
   }
 
-  const collageEntries = pickCollageEntries(orderedEntries, COLLAGE_IMAGE_COUNT);
-  if (collageEntries.length >= 2) {
-    const mediaUris = collageEntries.map((e) => getEntryMediaUri(e)).filter((u): u is string => u != null);
-    if (mediaUris.length >= 2) {
-      slides.push({
-        id: nextId(),
-        type: 'collage',
-        durationMs: COLLAGE_DURATION_MS,
-        payload: {
-          entryIds: collageEntries.map((e) => e.id),
-          mediaUris,
-          label: 'Your highlights',
-        } as RecapSlideCollagePayload,
-      });
+  // title_card — always
+  push('title_card', 30000, {
+    tripName: candidate.displayName,
+    dateRange: dateRangeStr,
+    backgroundPhotoUri: withPhotos[0] ? getPhotoUri(withPhotos[0])! : undefined,
+  } as TitleCardPayload);
+
+  // opening_stats — always
+  push('opening_stats', 6500, {
+    tripDays,
+    memoriesCount: nonDraft.length,
+    photosCount: computePhotosCount(nonDraft),
+    journalCount: albumJournals.length,
+  } as OpeningStatsPayload);
+
+  // beginning_of_trip_photos — first 35%, need at least 2 photos
+  const beginningPool = selectFromPercentile(nonDraft, 0, 0.35, 3, false);
+  if (beginningPool.length >= 2) {
+    const bgEntry = beginningPool[0];
+    const postcardEntries = beginningPool.slice(1);
+    push('beginning_of_trip_photos', 5000, {
+      bgPhotoUri: getPhotoUri(bgEntry)!,
+      postcards: postcardEntries.map(toPostcardItem),
+    } as BeginningPhotosPayload);
+  }
+
+  // ── ACT II ─────────────────────────────────────────────────────────────────
+
+  // activity_multiple_choice — conditional (≥2 days, unique peak day)
+  const choiceData = computeActivityChoiceData(nonDraft, album.id);
+  if (choiceData) {
+    push(
+      'activity_multiple_choice',
+      30000,
+      {
+        peakDay: choiceData.peakDay,
+        choices: choiceData.choices,
+      } as ActivityMultipleChoicePayload,
+      true // interactive
+    );
+  }
+
+  // activity_distribution_graph — ≥2 distinct days with entries
+  const distinctDays = new Set(nonDraft.map((e) => e.timestamp.slice(0, 10))).size;
+  if (distinctDays >= 2) {
+    const distrib = computeActivityDistribution(nonDraft, startDate, endDate);
+    push('activity_distribution_graph', 7000, {
+      data: distrib.data,
+      xAxisMode: distrib.xAxisMode,
+    } as ActivityDistributionPayload);
+  }
+
+  // color_palette — always (fallback palette if no data)
+  push('color_palette', 5000, {
+    colors: allColors,
+    tripLabel: candidate.displayName,
+  } as ColorPalettePayload);
+
+  // color_palette_photo — entry with lowest saturation palette
+  const lowSatEntry = selectLowSaturationPhotoEntry(nonDraft);
+  if (lowSatEntry) {
+    const palette = lowSatEntry.colorPalettes?.[0] ?? allColors;
+    push('color_palette_photo', 5000, {
+      colors: palette,
+      photoUri: getPhotoUri(lowSatEntry)!,
+    } as ColorPalettePhotoPayload);
+  }
+
+  // emotion_data — ≥1 entry with emotion labels
+  const entriesWithEmotions = nonDraft.filter((e) => (e.emotionLabels?.length ?? 0) > 0);
+  if (entriesWithEmotions.length >= 1 && emotionAgg.length > 0) {
+    push('emotion_data', 6000, {
+      emotions: emotionAgg.slice(0, 8),
+    } as EmotionDataPayload);
+  }
+
+  // journal_data — ≥1 journal entry
+  if (albumJournals.length >= 1) {
+    const stats = computeJournalStats(albumJournals);
+    push('journal_data', 6500, stats as JournalDataPayload);
+  }
+
+  // location_data — ≥1 entry with city or country
+  if (locationsByFreq.length >= 1) {
+    push('location_data', 6500, {
+      totalPlaces: locationsByFreq.length,
+      topPlaces: locationsByFreq.slice(0, 4).map((l) => ({ name: l.name, count: l.count })),
+    } as LocationDataPayload);
+  }
+
+  // graphic_location_data — ≥2 distinct locations with coordinates
+  if (locations.length >= 2) {
+    // Pick a postcard entry from the most-visited location
+    const topLocationName = locationsByFreq[0]?.name;
+    const postcardEntry = topLocationName
+      ? withPhotos.find(
+          (e) => e.city === topLocationName
+        ) ?? withPhotos[0]
+      : withPhotos[0];
+
+    if (postcardEntry) {
+      push('graphic_location_data', 6000, {
+        locations,
+        cityList: locations.map((l) => l.label).filter(Boolean),
+        postcard: toPostcardItem(postcardEntry),
+      } as GraphicLocationDataPayload);
     }
   }
 
-  const outroDisplayName = truncateDisplayNameForOutro(candidate.displayName);
-  slides.push({
-    id: nextId(),
-    type: 'outro',
-    durationMs: OUTRO_DURATION_MS,
-    payload: { message: `That's your ${outroDisplayName}.` } as RecapSlideOutroPayload,
-  });
+  // middle_of_trip_photos — 35–70% percentile, ≥1 photo
+  const middlePool = selectFromPercentile(nonDraft, 0.35, 0.70, 4, false);
+  if (middlePool.length >= 1) {
+    push('middle_of_trip_photos', 6000, {
+      photoUris: middlePool.map((e) => getPhotoUri(e)!),
+    } as MiddlePhotosPayload);
+  }
+
+  // weather_data — ≥2 distinct weather conditions
+  if (weatherAgg.length >= 2) {
+    // Pick photo from the most-frequent weather condition
+    const topCondition = weatherAgg[0].condition;
+    const photoEntry =
+      withPhotos.find((e) => e.weather === topCondition) ?? withPhotos[0];
+    if (photoEntry) {
+      push('weather_data', 5000, {
+        conditions: weatherAgg,
+        photoUri: getPhotoUri(photoEntry)!,
+      } as WeatherDataPayload);
+    }
+  }
+
+  // temperature_data — ≥3 entries with temperatureCelsius
+  const tempEntries = nonDraft.filter((e) => e.temperatureCelsius != null);
+  if (tempEntries.length >= 3) {
+    const closestEntry = findClosestToAvgTempEntry(nonDraft);
+    if (closestEntry) {
+      const temps = tempEntries.map((e) => e.temperatureCelsius!);
+      push('temperature_data', 5000, {
+        averageCelsius: temps.reduce((a, b) => a + b, 0) / temps.length,
+        lowestCelsius: Math.min(...temps),
+        highestCelsius: Math.max(...temps),
+        photoUri: getPhotoUri(closestEntry)!,
+      } as TemperatureDataPayload);
+    }
+  }
+
+  // altitude_data — ≥2 photo-entries with altitude, spread >100m
+  const altExtremes = findAltitudeExtremes(nonDraft);
+  if (altExtremes) {
+    push('altitude_data', 5000, {
+      lowest: {
+        altitudeMeters: altExtremes.lowest.altitudeMeters,
+        photoUri: getPhotoUri(altExtremes.lowest.entry)!,
+      },
+      highest: {
+        altitudeMeters: altExtremes.highest.altitudeMeters,
+        photoUri: getPhotoUri(altExtremes.highest.entry)!,
+      },
+    } as AltitudeDataPayload);
+  }
+
+  // ── ACT III ────────────────────────────────────────────────────────────────
+
+  // end_of_trip_photos — last 30%, up to 6, isAwe-prioritized
+  let endPool = selectFromPercentile(nonDraft, 0.70, 1.0, 6, true);
+  if (endPool.length === 0) endPool = withPhotos.slice(-3); // fallback
+  if (endPool.length > 0) {
+    push('end_of_trip_photos', endPool.length * 1000, {
+      postcards: endPool.map(toPostcardItem),
+    } as EndPhotosPayload);
+  }
 
   return slides;
 }

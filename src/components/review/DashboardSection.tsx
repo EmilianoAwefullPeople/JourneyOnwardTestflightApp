@@ -23,6 +23,7 @@ import { getDayCountrySnapshotsForDayKeys } from '../../storage/dayCountrySnapsh
 import DashboardDayFlagCalendar from './DashboardDayFlagCalendar';
 import DashboardGeneralKpiStrip from './DashboardGeneralKpiStrip';
 import { useDashboardColorPalette } from '../../hooks/useDashboardColorPalette';
+import DashboardEmotionalDataSection from './DashboardEmotionalDataSection';
 
 interface DashboardSectionProps {
   entries: Entry[];
@@ -36,7 +37,9 @@ interface DashboardSectionProps {
 
 const MONTHS_TO_SHOW = 6;
 const CHART_HEIGHT = 148;
-const CHART_PADDING = { left: 8, right: 8, top: 10, bottom: 26 };
+/** Left gutter for Y-axis tick labels (plot starts after this). */
+const CHART_Y_LABEL_GUTTER = 34;
+const CHART_PADDING = { left: 6 + CHART_Y_LABEL_GUTTER, right: 8, top: 10, bottom: 26 };
 const MAX_COUNTRY_GEOCODE_COORDS = 40;
 const WEATHER_COLUMNS_LIMIT = 6;
 const JOURNALING_BAR_MIN_PCT = 12;
@@ -65,6 +68,55 @@ function niceYMax(max: number): number {
   return 10 * magnitude;
 }
 
+/** Nice step for axis ticks (similar spirit to niceYMax). */
+function niceTickStep(rough: number): number {
+  if (!Number.isFinite(rough) || rough <= 0) return 1;
+  const pow10 = Math.pow(10, Math.floor(Math.log10(rough)));
+  const n = rough / pow10;
+  if (n <= 1) return pow10;
+  if (n <= 2) return 2 * pow10;
+  if (n <= 5) return 5 * pow10;
+  return 10 * pow10;
+}
+
+type DashboardLineChartYTickFormat = 'integer' | 'meters';
+
+/** Builds ~4–6 tick values from 0..yMax for chart grid + labels. */
+function buildChartYTicks(yMax: number, format: DashboardLineChartYTickFormat): number[] {
+  const max = Math.max(Number.isFinite(yMax) && yMax > 0 ? yMax : 1, 1);
+  const roughStep = max / 4;
+  const step =
+    format === 'integer' && max <= 3 ? 1 : Math.max(format === 'integer' ? 1 : 0.0001, niceTickStep(roughStep));
+  const ticks: number[] = [];
+  for (let v = 0; v <= max + step * 1e-6; v += step) {
+    const rounded = format === 'integer' ? Math.round(v) : Math.round(v * 10) / 10;
+    if (rounded <= max + 1e-6) ticks.push(rounded);
+    if (ticks.length > 10) break;
+  }
+  const last = ticks[ticks.length - 1];
+  if (last === undefined || last < max - 1e-4) {
+    const end = format === 'integer' ? Math.round(max) : Math.round(max * 10) / 10;
+    if (ticks.length === 0 || ticks[ticks.length - 1] !== end) ticks.push(end);
+  }
+  return [...new Set(ticks)].sort((a, b) => a - b);
+}
+
+function formatYTickInteger(value: number): string {
+  return String(Math.round(value));
+}
+
+function formatYTickMeters(value: number): string {
+  const m = Math.round(value);
+  if (!Number.isFinite(m)) return '';
+  if (m >= 10_000) return `${Math.round(m / 1000)}km`;
+  if (m >= 1000) {
+    const km = m / 1000;
+    const rounded = Math.abs(km - Math.round(km)) < 0.05 ? Math.round(km) : Math.round(km * 10) / 10;
+    return `${rounded}km`;
+  }
+  return `${m}m`;
+}
+
 function getWeatherIconName(condition: string): WeatherIconName {
   const normalized = condition.trim().toLowerCase();
   if (normalized.includes('sun') || normalized.includes('clear')) return 'sunny-outline';
@@ -84,11 +136,11 @@ function formatCompactMetric(value: number): string {
   return value.toLocaleString();
 }
 
-function getMonthBuckets() {
-  const now = new Date();
+function getMonthBuckets(anchorDate: Date) {
+  const base = Number.isFinite(anchorDate.getTime()) ? anchorDate : new Date();
   const rows: { key: string; label: string }[] = [];
   for (let i = MONTHS_TO_SHOW - 1; i >= 0; i--) {
-    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const d = new Date(base.getFullYear(), base.getMonth() - i, 1);
     rows.push({
       key: `${d.getUTCFullYear()}-${d.getUTCMonth()}`,
       label: d.toLocaleDateString('en-US', { month: 'short' }).toUpperCase(),
@@ -230,17 +282,30 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
   tabBarVisibilityProgress = 1,
 }) => {
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
-  const { colors } = useTheme();
+  const { colors, isDark } = useTheme();
   const insets = useSafeAreaInsets();
   const screenWidth = Dimensions.get('window').width;
   const chartWidth = screenWidth - SPACING.md * 2 - SPACING.lg * 2;
   const [latestLocation, setLatestLocation] = useState('Location unavailable');
   const [countryByCoord, setCountryByCoord] = useState<Record<string, string>>({});
   const [calendarSnapshots, setCalendarSnapshots] = useState<Record<string, string>>({});
-  const [calendarAnchor] = useState(() => {
-    const n = new Date();
-    return { y: n.getFullYear(), m: n.getMonth() };
-  });
+  const calendarAnchor = useMemo(() => {
+    const now = new Date();
+    if (!tripFilterActive || tripAlbums.length === 0) {
+      return { y: now.getFullYear(), m: now.getMonth() };
+    }
+
+    const album = tripAlbums[0];
+    const albumStart = new Date(album.startDate);
+    const albumEnd = album.endDate ? new Date(album.endDate) : null;
+    const isAlbumActive =
+      Number.isFinite(albumStart.getTime()) &&
+      albumStart.getTime() <= now.getTime() &&
+      (!albumEnd || albumEnd.getTime() >= now.getTime());
+
+    const anchorDate = isAlbumActive || !Number.isFinite(albumStart.getTime()) ? now : albumStart;
+    return { y: anchorDate.getFullYear(), m: anchorDate.getMonth() };
+  }, [tripFilterActive, tripAlbums]);
 
   const hasNoData = entries.length === 0 && journals.length === 0;
 
@@ -263,39 +328,54 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
     return m;
   }, [entries]);
 
+  /** Hero location: current device position (not last entry). Refreshes when app becomes active. */
   useEffect(() => {
+    if (tripFilterActive) return;
     let cancelled = false;
-    const latestItemWithCoords = [...entries, ...journals]
-      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-      .find((item) => item.latitude != null && item.longitude != null);
 
-    if (!latestItemWithCoords || latestItemWithCoords.latitude == null || latestItemWithCoords.longitude == null) {
-      const latestAlbumWithLocation = [...tripAlbums]
-        .filter((album) => typeof album.locationName === 'string' && album.locationName.trim().length > 0)
-        .sort((a, b) => new Date(b.updatedAt ?? b.createdAt ?? 0).getTime() - new Date(a.updatedAt ?? a.createdAt ?? 0).getTime())[0];
-      setLatestLocation(latestAlbumWithLocation?.locationName?.trim() || 'Location unavailable');
-      return;
-    }
+    const refreshUserLocation = async () => {
+      try {
+        const locationModule = await import('expo-location');
+        const { status } = await locationModule.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          if (!cancelled) setLatestLocation('Location unavailable');
+          return;
+        }
 
-    const persistedCity = 'city' in latestItemWithCoords ? (latestItemWithCoords as Entry).city?.trim() : '';
-    const persistedCountry = 'country' in latestItemWithCoords ? (latestItemWithCoords as Entry).country?.trim() : '';
-    const persistedLabel = [persistedCity, persistedCountry].filter(Boolean).join(', ');
-    if (persistedLabel) {
-      setLatestLocation(persistedLabel);
-      return;
-    }
+        const locationPromise = locationModule.getCurrentPositionAsync({
+          accuracy: locationModule.Accuracy.Balanced,
+        });
+        const timeoutPromise = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Location timeout')), 10000)
+        );
 
-    (async () => {
-      const label = await getCityCountryLabel(latestItemWithCoords.latitude!, latestItemWithCoords.longitude!);
-      if (!cancelled) {
-        setLatestLocation(label ?? 'Location unavailable');
+        const location = (await Promise.race([locationPromise, timeoutPromise])) as {
+          coords: { latitude: number; longitude: number };
+        };
+        const { latitude, longitude } = location.coords;
+
+        const label = await getCityCountryLabel(latitude, longitude);
+        if (!cancelled) {
+          const trimmed = label?.trim();
+          setLatestLocation(trimmed || `${latitude.toFixed(4)}, ${longitude.toFixed(4)}`);
+        }
+      } catch {
+        if (!cancelled) setLatestLocation('Location unavailable');
       }
-    })();
+    };
+
+    void refreshUserLocation();
+
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') return;
+      void refreshUserLocation();
+    });
 
     return () => {
       cancelled = true;
+      sub.remove();
     };
-  }, [entries, journals, tripAlbums]);
+  }, [tripFilterActive]);
 
   useEffect(() => {
     let cancelled = false;
@@ -330,6 +410,10 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
   }, [entries, journals, seededCountryByCoord]);
 
   useEffect(() => {
+    if (tripFilterActive) {
+      setCalendarSnapshots({});
+      return;
+    }
     let cancelled = false;
     const keys = localDayKeysInMonth(calendarAnchor.y, calendarAnchor.m);
     (async () => {
@@ -342,6 +426,7 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
   }, [calendarAnchor.y, calendarAnchor.m]);
 
   useEffect(() => {
+    if (tripFilterActive) return;
     const sub = AppState.addEventListener('change', (state) => {
       if (state !== 'active') return;
       const keys = localDayKeysInMonth(calendarAnchor.y, calendarAnchor.m);
@@ -371,11 +456,40 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
 
   const mergedDayDisplay = useMemo(() => {
     const keys = localDayKeysInMonth(calendarAnchor.y, calendarAnchor.m);
+    if (tripFilterActive) {
+      const fromTripCaptureOnly: Record<string, string> = {};
+      for (const key of keys) {
+        fromTripCaptureOnly[key] = captureCountryByDay[key] ?? '';
+      }
+      return fromTripCaptureOnly;
+    }
     return buildMergedDayCountryDisplay(keys, captureCountryByDay, calendarSnapshots);
-  }, [calendarAnchor.y, calendarAnchor.m, captureCountryByDay, calendarSnapshots]);
+  }, [calendarAnchor.y, calendarAnchor.m, captureCountryByDay, calendarSnapshots, tripFilterActive]);
+
+  const trendAnchorDate = useMemo(() => {
+    const now = new Date();
+    if (!tripFilterActive || tripAlbums.length === 0) return now;
+
+    const album = tripAlbums[0];
+    const start = new Date(album.startDate);
+    const end = album.endDate ? new Date(album.endDate) : null;
+    const hasValidStart = Number.isFinite(start.getTime());
+    const hasValidEnd = end ? Number.isFinite(end.getTime()) : false;
+    const isActive =
+      hasValidStart &&
+      start.getTime() <= now.getTime() &&
+      (!end || (hasValidEnd && end.getTime() >= now.getTime()));
+
+    if (isActive) return now;
+    if (hasValidEnd && end) return end;
+    if (hasValidStart) return start;
+    return now;
+  }, [tripFilterActive, tripAlbums]);
+
+  const monthBuckets = useMemo(() => getMonthBuckets(trendAnchorDate), [trendAnchorDate]);
 
   const monthlyData = useMemo(() => {
-    const buckets = getMonthBuckets().map((b) => ({ ...b, experiences: 0, notes: 0, altitudeTotal: 0, altitudeCount: 0 }));
+    const buckets = monthBuckets.map((b) => ({ ...b, experiences: 0, notes: 0, altitudeTotal: 0, altitudeCount: 0 }));
     const byKey = new Map(buckets.map((row, index) => [row.key, index]));
     entries.forEach((entry) => {
       const idx = byKey.get(toMonthKey(entry.timestamp));
@@ -395,7 +509,7 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
       ...row,
       altitudeAverage: row.altitudeCount > 0 ? row.altitudeTotal / row.altitudeCount : 0,
     }));
-  }, [entries, journals]);
+  }, [entries, journals, monthBuckets]);
 
   const chartData = useMemo(() => {
     const experiences = monthlyData.map((row) => row.experiences);
@@ -479,7 +593,7 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
     if (journalStats.totalEntries <= 0) return [];
     const rows: { id: JournalingColumnId; label: string; value: number }[] = [
       { id: 'entries', label: 'Entries', value: journalStats.totalEntries },
-      { id: 'words', label: 'Words', value: journalStats.totalWords },
+      { id: 'words', label: 'Total words', value: journalStats.totalWords },
       { id: 'avg', label: 'Avg. words/entry', value: journalStats.averageWords },
     ];
     const maxValue = Math.max(1, ...rows.map((row) => row.value));
@@ -493,8 +607,8 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
   }, [journalStats]);
 
   const paletteScope = useMemo(
-    () => (!tripFilterActive ? 'all' : entries.find(e => e.albumId)?.albumId ?? 'all'),
-    [tripFilterActive, entries]
+    () => (!tripFilterActive ? 'all' : tripAlbums[0]?.id ?? entries.find(e => e.albumId)?.albumId ?? 'all'),
+    [tripFilterActive, tripAlbums, entries]
   );
   const { colors: paletteColors, paletteState } = useDashboardColorPalette(entries, paletteScope);
 
@@ -533,16 +647,18 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
       ) : null}
 
       <View style={styles.heroSummary}>
-        <View style={styles.heroMeta}>
-          <View style={styles.heroMetaRow}>
-            <Ionicons name="calendar-outline" size={22} color={colors.textSecondary} />
-            <Text style={[styles.heroMetaText, { color: colors.textSecondary }]}>{todayDateLabel}</Text>
+        {!tripFilterActive ? (
+          <View style={styles.heroMeta}>
+            <View style={styles.heroMetaRow}>
+              <Ionicons name="calendar-outline" size={22} color={colors.textSecondary} />
+              <Text style={[styles.heroMetaText, { color: colors.textSecondary }]}>{todayDateLabel}</Text>
+            </View>
+            <View style={styles.heroMetaRow}>
+              <Ionicons name="location-outline" size={22} color={colors.textSecondary} />
+              <Text style={[styles.heroMetaText, { color: colors.textSecondary }]}>{latestLocation}</Text>
+            </View>
           </View>
-          <View style={styles.heroMetaRow}>
-            <Ionicons name="location-outline" size={22} color={colors.textSecondary} />
-            <Text style={[styles.heroMetaText, { color: colors.textSecondary }]}>{latestLocation}</Text>
-          </View>
-        </View>
+        ) : null}
 
         <DashboardGeneralKpiStrip
           innerWidth={chartWidth}
@@ -562,6 +678,7 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
             labels={chartData.labels}
             primary={chartData.combined}
             yMax={maxMemoriesJournalTrend}
+            yTickFormat="integer"
             variant="smoothArea"
             pointMarkers
             colors={{
@@ -674,7 +791,19 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
         )}
       </DashboardCard>
 
-      <DashboardCard title="Your color palette" subtitle="The dominant colors extracted from all your photos" subtitleItalic>
+      <DashboardCard title="Emotional data">
+        <DashboardEmotionalDataSection entries={entries} colors={colors} width={chartWidth} isDark={isDark} />
+      </DashboardCard>
+
+      <DashboardCard
+        title="Your color palette"
+        subtitle={
+          tripFilterActive
+            ? "The dominant colors extracted from this trip's photos"
+            : 'The dominant colors extracted from all your photos'
+        }
+        subtitleItalic
+      >
         {paletteState === 'no-photos' ? (
           <Text style={[styles.placeholderText, { color: colors.textSecondary }]}>
             Capture photos to see your travel color palette.
@@ -708,6 +837,7 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
             labels={chartData.labels}
             primary={chartData.altitude}
             yMax={maxAltitude}
+            yTickFormat="meters"
             variant="smoothArea"
             pointMarkers
             colors={{
@@ -766,16 +896,31 @@ const SimpleLineChart: React.FC<{
   primary: number[];
   secondary?: number[];
   yMax: number;
+  yTickFormat?: DashboardLineChartYTickFormat;
   colors: { primary: string; secondary?: string; tertiary?: string; axis: string; text: string };
   variant?: SimpleLineChartVariant;
   pointMarkers?: boolean;
-}> = ({ width, height, labels, primary, secondary, yMax, colors, variant = 'linear', pointMarkers = false }) => {
+}> = ({
+  width,
+  height,
+  labels,
+  primary,
+  secondary,
+  yMax,
+  yTickFormat = 'integer',
+  colors,
+  variant = 'linear',
+  pointMarkers = false,
+}) => {
   const fillGradientId = `chartFill_${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`;
   const strokeGradientId = `chartStroke_${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`;
   const plotWidth = width - CHART_PADDING.left - CHART_PADDING.right;
   const plotHeight = height - CHART_PADDING.top - CHART_PADDING.bottom;
   const bottomY = CHART_PADDING.top + plotHeight;
   const safeYMax = Number.isFinite(yMax) && yMax > 0 ? yMax : 1;
+
+  const yTicks = useMemo(() => buildChartYTicks(safeYMax, yTickFormat), [safeYMax, yTickFormat]);
+  const formatYTickLabel = yTickFormat === 'meters' ? formatYTickMeters : formatYTickInteger;
 
   const count = Math.min(primary.length, labels.length);
   if (__DEV__ && primary.length !== labels.length) {
@@ -821,23 +966,24 @@ const SimpleLineChart: React.FC<{
       : null;
 
   return (
-    <View>
-      <Svg width={width} height={height}>
-        {[0, 0.25, 0.5, 0.75, 1].map((tick) => {
-          const y = CHART_PADDING.top + plotHeight * tick;
-          return (
-            <Line
-              key={tick}
-              x1={CHART_PADDING.left}
-              y1={y}
-              x2={width - CHART_PADDING.right}
-              y2={y}
-              stroke={colors.axis}
-              strokeWidth={0.8}
-              opacity={0.35}
-            />
-          );
-        })}
+    <View style={{ width }}>
+      <View style={{ position: 'relative', width, height }}>
+        <Svg width={width} height={height}>
+          {yTicks.map((tick) => {
+            const y = CHART_PADDING.top + (1 - tick / safeYMax) * plotHeight;
+            return (
+              <Line
+                key={`ygrid-${tick}`}
+                x1={CHART_PADDING.left}
+                y1={y}
+                x2={width - CHART_PADDING.right}
+                y2={y}
+                stroke={colors.axis}
+                strokeWidth={0.8}
+                opacity={0.35}
+              />
+            );
+          })}
         {variant === 'smoothArea' && (smoothAreaPath || liveAura) ? (
           <Defs>
             {liveAura ? (
@@ -913,7 +1059,26 @@ const SimpleLineChart: React.FC<{
         {showLastPrimaryMarkerOnly ? (
           <Circle cx={primaryPts[primaryPts.length - 1].x} cy={primaryPts[primaryPts.length - 1].y} r={4} fill={colors.primary} />
         ) : null}
-      </Svg>
+        </Svg>
+        <View pointerEvents="none" style={[styles.chartYAxisOverlay, { width, height }]}>
+          {yTicks.map((tick) => {
+            const y = CHART_PADDING.top + (1 - tick / safeYMax) * plotHeight;
+            return (
+              <Text
+                key={`ylabel-${tick}`}
+                style={[
+                  styles.chartYTickText,
+                  { color: colors.text, top: Math.max(0, y - 8), width: CHART_Y_LABEL_GUTTER },
+                ]}
+                numberOfLines={1}
+                maxFontSizeMultiplier={1.2}
+              >
+                {formatYTickLabel(tick)}
+              </Text>
+            );
+          })}
+        </View>
+      </View>
       <View style={styles.chartLabels}>
         {labelRow.map((label, idx) => (
           <Text key={`${label}-${idx}`} style={[styles.chartLabelText, { color: colors.text }]}>
@@ -1181,6 +1346,19 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     marginTop: SPACING.xs,
+  },
+  chartYAxisOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    pointerEvents: 'none',
+  },
+  chartYTickText: {
+    ...TEXT_STYLES.entryInput,
+    position: 'absolute',
+    left: 0,
+    fontSize: 9,
+    lineHeight: 11,
+    textAlign: 'right',
+    paddingRight: 2,
   },
   chartLabelText: {
     ...TEXT_STYLES.entryInput,

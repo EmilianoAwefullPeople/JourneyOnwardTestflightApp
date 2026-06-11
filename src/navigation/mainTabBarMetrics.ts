@@ -29,7 +29,7 @@ export function getEffectiveMainTabInset(insetsBottom: number, visibilityProgres
 }
 
 /**
- * Bottom padding for ScrollView content on Studio / Review sections above the main tab bar.
+ * Bottom padding for ScrollView content on Review sections above the main tab bar.
  * @param breathingRoom - extra pt below chrome (e.g. SPACING.md)
  */
 export function getMainTabScrollContentPaddingBottom(insetsBottom: number, breathingRoom = 0): number {
