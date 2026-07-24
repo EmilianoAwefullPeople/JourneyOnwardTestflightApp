@@ -1072,7 +1072,6 @@ const OnboardingSlidesScreen: React.FC = () => {
         onMomentumScrollEnd={onMomentumScrollEnd}
         getItemLayout={getItemLayout}
         extraData={currentIndex}
-        initialScrollIndex={3 /* TEMP: preview only, revert before commit */}
         renderItem={({ item, index }) => (
           <SlideItem
             slide={item}

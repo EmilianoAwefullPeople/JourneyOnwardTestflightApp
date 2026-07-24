@@ -632,7 +632,7 @@ export const AppNavigator: React.FC = () => {
   return (
     <NavigationContainer ref={navigationRef}>
       <Stack.Navigator
-        initialRouteName={'OnboardingSlides' /* TEMP: forced for onboarding preview, revert before commit */}
+        initialRouteName={hasCompletedOnboarding ? 'MainTabs' : 'OnboardingSlides'}
         screenOptions={{
           headerShown: false,
           gestureEnabled: true,
