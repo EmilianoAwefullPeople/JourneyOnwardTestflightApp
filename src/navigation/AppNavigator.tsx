@@ -112,6 +112,8 @@ const MainTabs = () => {
   const insets = useSafeAreaInsets();
 
   const { colors } = useTheme();
+  const { travelModeEnabled, activeTripAlbums } = useAppContext();
+  const isTravelModeActive = travelModeEnabled && activeTripAlbums.length > 0;
   const { hidden, visibilityProgress, setActiveRouteKey } = useMainTabBarVisibilityController();
   const tabBarTranslateY = useRef(new Animated.Value(0)).current;
 
@@ -372,56 +374,100 @@ const MainTabs = () => {
           <View style={[styles.plusMenuHandle, { backgroundColor: colors.border }]} />
         </View>
 
-        <TouchableOpacity
-          style={styles.plusMenuItem}
-          onPress={() => handlePlusMenuAction('ImportLatest')}
-          activeOpacity={0.75}
-          accessibilityRole="button"
-          accessibilityLabel="Import Memories"
-        >
-          <View style={[styles.plusMenuItemIcon, { backgroundColor: colors.surfaceVariant }]}>
+        {/* Featured: Unpack A Trip — top priority, hidden while travel mode is active (unpacking is a post-trip action) */}
+        {!isTravelModeActive && (
+          <View style={styles.plusMenuFeaturedSection}>
+            <LinearGradient
+              colors={[COLORS.babyBlue, COLORS.royalGold, COLORS.lime800]}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 1 }}
+              style={styles.plusMenuFeaturedGradientBorder}
+            >
+            <TouchableOpacity
+              style={[
+                styles.plusMenuFeaturedCard,
+                { backgroundColor: colors.surfaceVariant },
+              ]}
+              onPress={() => handlePlusMenuAction('UnpackTripDetails')}
+              activeOpacity={0.75}
+              accessibilityRole="button"
+              accessibilityLabel="Unpack A Trip"
+            >
+              <View style={[styles.plusMenuFeaturedIcon, { backgroundColor: COLORS.royalGold + '22' }]}>
+                <Ionicons name="sparkles" size={20} color={COLORS.royalGold} />
+              </View>
+              <View style={[styles.plusMenuItemTextColumn, { gap: 3 }]}>
+                <Text style={[styles.plusMenuItemLabel, { color: colors.textPrimary }]}>Unpack A Trip</Text>
+                <Text style={[styles.plusMenuItemSubtitle, { color: colors.textSecondary }]}>
+                  Turn memories into an organized story worth sharing
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={16} color={colors.textSecondary} />
+            </TouchableOpacity>
+            </LinearGradient>
+          </View>
+        )}
+
+        {/* Secondary priority — top priority while travel mode is active */}
+        <View style={styles.plusMenuGridRow}>
+          <TouchableOpacity
+            style={[styles.plusMenuGridTile, { backgroundColor: colors.surfaceVariant }]}
+            onPress={() => handlePlusMenuAction('Capture')}
+            activeOpacity={0.75}
+            accessibilityRole="button"
+            accessibilityLabel="Live Capture"
+          >
+            <Ionicons name="camera-outline" size={22} color={colors.textPrimary} />
+            <Text style={[styles.plusMenuGridLabel, { color: colors.textPrimary }]}>Live Capture</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.plusMenuGridTile, { backgroundColor: colors.surfaceVariant }]}
+            onPress={() => handlePlusMenuAction('ImportLatest')}
+            activeOpacity={0.75}
+            accessibilityRole="button"
+            accessibilityLabel="Import Memories"
+          >
             <Ionicons name="sync-outline" size={22} color={colors.textPrimary} />
-          </View>
-          <View style={styles.plusMenuItemTextColumn}>
-            <Text style={[styles.plusMenuItemLabel, { color: colors.textPrimary }]}>Import Memories</Text>
-            <Text style={[styles.plusMenuItemSubtitle, { color: colors.textSecondary }]}>Add photos from your camera roll</Text>
-          </View>
-        </TouchableOpacity>
+            <Text style={[styles.plusMenuGridLabel, { color: colors.textPrimary }]}>Import Memories</Text>
+          </TouchableOpacity>
+        </View>
 
-        <View style={[styles.plusMenuDivider, { backgroundColor: colors.border }]} />
-
-        <TouchableOpacity
-          style={styles.plusMenuItem}
-          onPress={() => handlePlusMenuAction('PostcardTemplates')}
-          activeOpacity={0.75}
-          accessibilityRole="button"
-          accessibilityLabel="Create A Postcard"
-        >
-          <View style={[styles.plusMenuItemIcon, { backgroundColor: colors.surfaceVariant }]}>
+        {/* Third priority */}
+        <View style={styles.plusMenuGridRow}>
+          <TouchableOpacity
+            style={[styles.plusMenuGridTile, { backgroundColor: colors.surfaceVariant }]}
+            onPress={() => handlePlusMenuAction('PostcardTemplates')}
+            activeOpacity={0.75}
+            accessibilityRole="button"
+            accessibilityLabel="Create A Postcard"
+          >
             <Ionicons name="image-outline" size={22} color={colors.textPrimary} />
-          </View>
-          <View style={styles.plusMenuItemTextColumn}>
-            <Text style={[styles.plusMenuItemLabel, { color: colors.textPrimary }]}>Create A Postcard</Text>
-            <Text style={[styles.plusMenuItemSubtitle, { color: colors.textSecondary }]}>Graphic design for your memories</Text>
-          </View>
-        </TouchableOpacity>
+            <Text style={[styles.plusMenuGridLabel, { color: colors.textPrimary }]}>Create A Postcard</Text>
+          </TouchableOpacity>
 
-        <View style={[styles.plusMenuDivider, { backgroundColor: colors.border }]} />
+          <TouchableOpacity
+            style={[styles.plusMenuGridTile, { backgroundColor: colors.surfaceVariant }]}
+            onPress={() => handlePlusMenuAction('NotesEditor')}
+            activeOpacity={0.75}
+            accessibilityRole="button"
+            accessibilityLabel="Journal Entry"
+          >
+            <Ionicons name="pencil-outline" size={22} color={colors.textPrimary} />
+            <Text style={[styles.plusMenuGridLabel, { color: colors.textPrimary }]}>Journal Entry</Text>
+          </TouchableOpacity>
+        </View>
 
+        {/* Final priority — low-emphasis link row */}
         <TouchableOpacity
-          style={styles.plusMenuItem}
+          style={styles.plusMenuMinorRow}
           onPress={() => handlePlusMenuAction('TripAlbumCreate')}
           activeOpacity={0.75}
           accessibilityRole="button"
           accessibilityLabel="New Trip Album"
         >
-          <View style={[styles.plusMenuItemIcon, { backgroundColor: colors.surfaceVariant }]}>
-            <Ionicons name="book-outline" size={22} color={colors.textPrimary} />
-          </View>
-          <View style={styles.plusMenuItemTextColumn}>
-            <Text style={[styles.plusMenuItemLabel, { color: colors.textPrimary }]}>New Trip Album</Text>
-            <Text style={[styles.plusMenuItemSubtitle, { color: colors.textSecondary }]}>Organize your memories by trips</Text>
-          </View>
+          <Ionicons name="book-outline" size={18} color={colors.textSecondary} />
+          <Text style={[styles.plusMenuMinorLabel, { color: colors.textSecondary }]}>New Trip Album</Text>
         </TouchableOpacity>
       </Animated.View>
     </View>
@@ -431,7 +477,7 @@ const MainTabs = () => {
 // Root Stack Navigator
 // All navigators are lazy-loaded to prevent module-level initialization
 export const AppNavigator: React.FC = () => {
-  const { isLoading, isFirstLaunch, onboardingCompleted } = useAppContext();
+  const { isLoading, hasCompletedOnboarding } = useAppContext();
   const { colors } = useTheme();
 
   // Lazy-load React Navigation modules only when component renders
@@ -439,14 +485,6 @@ export const AppNavigator: React.FC = () => {
   const createNativeStackNavigator = require('@react-navigation/native-stack').createNativeStackNavigator;
 
   // Lazy-load all screens only when component renders
-  const LoadingScreen = useMemo(() => {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/LoadingScreen'), 'LoadingScreen');
-  }, []);
-  const WelcomeScreen = useMemo(() => {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/WelcomeScreen'), 'WelcomeScreen');
-  }, []);
   const CaptureScreen = useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     return screenFromModule(require('../screens/CaptureScreen'), 'CaptureScreen');
@@ -507,13 +545,25 @@ export const AppNavigator: React.FC = () => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     return screenFromModule(require('../screens/JourneyRecapPostScreen'), 'JourneyRecapPostScreen');
   }, []);
+  const MemoriesSlideshowScreen = useMemo(() => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return screenFromModule(require('../screens/MemoriesSlideshowScreen'), 'MemoriesSlideshowScreen');
+  }, []);
   const FullCountryCalendarScreen = useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     return screenFromModule(require('../screens/FullCountryCalendarScreen'), 'FullCountryCalendarScreen');
   }, []);
+  const DayDetailScreen = useMemo(() => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return screenFromModule(require('../screens/DayDetailScreen'), 'DayDetailScreen');
+  }, []);
   const CountryRankingFullListScreen = useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     return screenFromModule(require('../screens/CountryRankingFullListScreen'), 'CountryRankingFullListScreen');
+  }, []);
+  const CountriesVisitedMapScreen = useMemo(() => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return screenFromModule(require('../screens/CountriesVisitedMapScreen'), 'CountriesVisitedMapScreen');
   }, []);
   const PostcardTemplatesScreen = useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -527,59 +577,45 @@ export const AppNavigator: React.FC = () => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     return screenFromModule(require('../screens/SavedPostcardsScreen'), 'SavedPostcards');
   }, []);
+  const PostcardStoryEditorScreen = useMemo(() => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return screenFromModule(require('../screens/PostcardStoryEditorScreen'), 'PostcardStoryEditor');
+  }, []);
   const SuggestedAlbumsScreen = useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     return screenFromModule(require('../screens/SuggestedAlbumsScreen'), 'SuggestedAlbumsScreen');
   }, []);
 
   // Onboarding screens
-  const OnboardingGateScreen = useMemo(() => {
+  const OnboardingSlidesScreen = useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/onboarding/OnboardingGateScreen'), 'OnboardingGateScreen');
+    return screenFromModule(require('../screens/onboarding/OnboardingSlidesScreen'), 'OnboardingSlidesScreen');
   }, []);
-  const OnboardingPathSelectScreen = useMemo(() => {
+  const OnboardingPathScreen = useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/onboarding/OnboardingPathSelectScreen'), 'OnboardingPathSelectScreen');
+    return screenFromModule(require('../screens/onboarding/OnboardingPathScreen'), 'OnboardingPathScreen');
   }, []);
-  const OnboardingQSCountryScreen = useMemo(() => {
+
+  // Unpack A Trip screens
+  const UnpackTripDetailsScreen = useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/onboarding/quickstart/OnboardingQSCountryScreen'), 'OnboardingQSCountryScreen');
+    return screenFromModule(require('../screens/unpack/UnpackTripDetailsScreen'), 'UnpackTripDetailsScreen');
   }, []);
-  const OnboardingQSImportScreen = useMemo(() => {
+  const UnpackAddMemoriesScreen = useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/onboarding/quickstart/OnboardingQSImportScreen'), 'OnboardingQSImportScreen');
+    return screenFromModule(require('../screens/unpack/UnpackAddMemoriesScreen'), 'UnpackAddMemoriesScreen');
   }, []);
-  const OnboardingQSProcessingScreen = useMemo(() => {
+  const UnpackProcessingScreen = useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/onboarding/quickstart/OnboardingQSProcessingScreen'), 'OnboardingQSProcessingScreen');
+    return screenFromModule(require('../screens/unpack/UnpackProcessingScreen'), 'UnpackProcessingScreen');
   }, []);
-  const OnboardingQSSelectExperiencesScreen = useMemo(() => {
+  const UnpackHighlightScreen = useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/onboarding/quickstart/OnboardingQSSelectExperiencesScreen'), 'OnboardingQSSelectExperiencesScreen');
+    return screenFromModule(require('../screens/unpack/UnpackHighlightScreen'), 'UnpackHighlightScreen');
   }, []);
-  const OnboardingQSExperiencesScreen = useMemo(() => {
+  const UnpackUnpackingScreen = useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/onboarding/quickstart/OnboardingQSExperiencesScreen'), 'OnboardingQSExperiencesScreen');
-  }, []);
-  const OnboardingQSGeneratingScreen = useMemo(() => {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/onboarding/quickstart/OnboardingQSGeneratingScreen'), 'OnboardingQSGeneratingScreen');
-  }, []);
-  const OnboardingQSResultsScreen = useMemo(() => {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/onboarding/quickstart/OnboardingQSResultsScreen'), 'OnboardingQSResultsScreen');
-  }, []);
-  const OnboardingQSEmailScreen = useMemo(() => {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/onboarding/quickstart/OnboardingQSEmailScreen'), 'OnboardingQSEmailScreen');
-  }, []);
-  const OnboardingTutorialScreen = useMemo(() => {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/onboarding/tutorial/OnboardingTutorialScreen'), 'OnboardingTutorialScreen');
-  }, []);
-  const OnboardingTutorialExitScreen = useMemo(() => {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return screenFromModule(require('../screens/onboarding/tutorial/OnboardingTutorialExitScreen'), 'OnboardingTutorialExitScreen');
+    return screenFromModule(require('../screens/unpack/UnpackUnpackingScreen'), 'UnpackUnpackingScreen');
   }, []);
 
   // Create Stack navigator inside component to defer initialization
@@ -588,26 +624,15 @@ export const AppNavigator: React.FC = () => {
   // Get navigation ref to programmatically navigate
   const navigationRef = React.useRef<any>(null);
 
-  // Show loading screen while app initializes
+  // Hold on splash-matched background while app data initializes
   if (isLoading) {
-    return (
-      <NavigationContainer ref={navigationRef}>
-        <Stack.Navigator screenOptions={{ headerShown: false }}>
-          <Stack.Screen name="Loading" component={LoadingScreen} />
-        </Stack.Navigator>
-      </NavigationContainer>
-    );
+    return <View style={{ flex: 1, backgroundColor: COLORS.splashBackground }} />;
   }
-
-  // Show onboarding if this is a first launch and onboarding has not yet been completed.
-  // Existing users (isFirstLaunch=false) bypass onboarding for backward compatibility.
-  const showOnboarding = isFirstLaunch && !onboardingCompleted;
-  const initialRouteName = showOnboarding ? 'OnboardingGate' : 'MainTabs';
 
   return (
     <NavigationContainer ref={navigationRef}>
       <Stack.Navigator
-        initialRouteName={initialRouteName}
+        initialRouteName={'OnboardingSlides' /* TEMP: forced for onboarding preview, revert before commit */}
         screenOptions={{
           headerShown: false,
           gestureEnabled: true,
@@ -615,8 +640,16 @@ export const AppNavigator: React.FC = () => {
           contentStyle: { backgroundColor: colors.background },
         }}
       >
-        <Stack.Screen name="Loading" component={LoadingScreen} />
-        <Stack.Screen name="Welcome" component={WelcomeScreen} />
+        <Stack.Screen
+          name="OnboardingSlides"
+          component={OnboardingSlidesScreen}
+          options={{ headerShown: false, gestureEnabled: false, animation: 'fade' }}
+        />
+        <Stack.Screen
+          name="OnboardingPath"
+          component={OnboardingPathScreen}
+          options={{ headerShown: false, gestureEnabled: false, animation: 'slide_from_right' }}
+        />
         <Stack.Screen name="MainTabs" component={MainTabsWithVisibility} />
         <Stack.Screen
           name="Capture"
@@ -763,6 +796,15 @@ export const AppNavigator: React.FC = () => {
           }}
         />
         <Stack.Screen
+          name="MemoriesSlideshow"
+          component={MemoriesSlideshowScreen}
+          options={{
+            headerShown: false,
+            presentation: 'card',
+            animation: 'default',
+          }}
+        />
+        <Stack.Screen
           name="FullCountryCalendar"
           component={FullCountryCalendarScreen}
           options={{
@@ -772,8 +814,26 @@ export const AppNavigator: React.FC = () => {
           }}
         />
         <Stack.Screen
+          name="DayDetail"
+          component={DayDetailScreen}
+          options={{
+            headerShown: false,
+            presentation: 'modal',
+            animation: 'default',
+          }}
+        />
+        <Stack.Screen
           name="CountryRankingFullList"
           component={CountryRankingFullListScreen}
+          options={{
+            headerShown: false,
+            presentation: 'card',
+            animation: 'default',
+          }}
+        />
+        <Stack.Screen
+          name="CountriesVisitedMapFull"
+          component={CountriesVisitedMapScreen}
           options={{
             headerShown: false,
             presentation: 'card',
@@ -808,6 +868,15 @@ export const AppNavigator: React.FC = () => {
           }}
         />
         <Stack.Screen
+          name="PostcardStoryEditor"
+          component={PostcardStoryEditorScreen}
+          options={{
+            headerShown: false,
+            presentation: 'card',
+            animation: 'default',
+          }}
+        />
+        <Stack.Screen
           name="SuggestedAlbums"
           component={SuggestedAlbumsScreen}
           options={{
@@ -816,66 +885,31 @@ export const AppNavigator: React.FC = () => {
             animation: 'default',
           }}
         />
-        {/* Onboarding screens */}
+        {/* Unpack A Trip screens */}
         <Stack.Screen
-          name="OnboardingGate"
-          component={OnboardingGateScreen}
-          options={{ headerShown: false, animation: 'default', gestureEnabled: false }}
+          name="UnpackTripDetails"
+          component={UnpackTripDetailsScreen}
+          options={{ headerShown: false, presentation: 'card', animation: 'default' }}
         />
         <Stack.Screen
-          name="OnboardingPathSelect"
-          component={OnboardingPathSelectScreen}
-          options={{ headerShown: false, animation: 'default', gestureEnabled: false }}
+          name="UnpackAddMemories"
+          component={UnpackAddMemoriesScreen}
+          options={{ headerShown: false, presentation: 'card', animation: 'default' }}
         />
         <Stack.Screen
-          name="OnboardingQSCountry"
-          component={OnboardingQSCountryScreen}
-          options={{ headerShown: false, animation: 'default' }}
-        />
-        <Stack.Screen
-          name="OnboardingQSImport"
-          component={OnboardingQSImportScreen}
-          options={{ headerShown: false, animation: 'default' }}
-        />
-        <Stack.Screen
-          name="OnboardingQSSelectExperiences"
-          component={OnboardingQSSelectExperiencesScreen}
-          options={{ headerShown: false, animation: 'default' }}
-        />
-        <Stack.Screen
-          name="OnboardingQSProcessing"
-          component={OnboardingQSProcessingScreen}
-          options={{ headerShown: false, animation: 'default', gestureEnabled: false }}
-        />
-        <Stack.Screen
-          name="OnboardingQSExperiences"
-          component={OnboardingQSExperiencesScreen}
-          options={{ headerShown: false, animation: 'default' }}
-        />
-        <Stack.Screen
-          name="OnboardingQSGenerating"
-          component={OnboardingQSGeneratingScreen}
+          name="UnpackProcessing"
+          component={UnpackProcessingScreen}
           options={{ headerShown: false, animation: 'none', gestureEnabled: false }}
         />
         <Stack.Screen
-          name="OnboardingQSResults"
-          component={OnboardingQSResultsScreen}
-          options={{ headerShown: false, animation: 'default', gestureEnabled: false }}
+          name="UnpackHighlight"
+          component={UnpackHighlightScreen}
+          options={{ headerShown: false, presentation: 'card', animation: 'default' }}
         />
         <Stack.Screen
-          name="OnboardingQSEmail"
-          component={OnboardingQSEmailScreen}
-          options={{ headerShown: false, animation: 'default' }}
-        />
-        <Stack.Screen
-          name="OnboardingTutorial"
-          component={OnboardingTutorialScreen}
-          options={{ headerShown: false, animation: 'default', gestureEnabled: false }}
-        />
-        <Stack.Screen
-          name="OnboardingTutorialExit"
-          component={OnboardingTutorialExitScreen}
-          options={{ headerShown: false, animation: 'default', gestureEnabled: false }}
+          name="UnpackUnpacking"
+          component={UnpackUnpackingScreen}
+          options={{ headerShown: false, presentation: 'card', animation: 'default' }}
         />
       </Stack.Navigator>
     </NavigationContainer>
@@ -971,20 +1005,6 @@ const styles = StyleSheet.create({
     height: 4,
     borderRadius: 2,
   },
-  plusMenuItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: SPACING.lg,
-    paddingVertical: 14,
-    gap: 16,
-  },
-  plusMenuItemIcon: {
-    width: 44,
-    height: 44,
-    borderRadius: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
   plusMenuItemTextColumn: {
     flex: 1,
     gap: 2,
@@ -999,9 +1019,58 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: FONT_WEIGHTS.regular as any,
   },
-  plusMenuDivider: {
-    height: StyleSheet.hairlineWidth,
-    marginLeft: SPACING.lg + 44 + 16,
-    marginRight: SPACING.lg,
+  plusMenuGridRow: {
+    flexDirection: 'row',
+    gap: 12,
+    paddingHorizontal: SPACING.lg,
+    marginBottom: 12,
+  },
+  plusMenuGridTile: {
+    flex: 1,
+    borderRadius: 16,
+    paddingVertical: 16,
+    paddingHorizontal: 14,
+    gap: 10,
+  },
+  plusMenuGridLabel: {
+    fontFamily: FONTS.inter,
+    fontSize: 14,
+    fontWeight: FONT_WEIGHTS.semibold as any,
+  },
+  plusMenuMinorRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingVertical: 12,
+  },
+  plusMenuMinorLabel: {
+    fontFamily: FONTS.inter,
+    fontSize: 14,
+    fontWeight: FONT_WEIGHTS.regular as any,
+  },
+  plusMenuFeaturedSection: {
+    paddingHorizontal: SPACING.lg,
+    paddingTop: SPACING.xs,
+    paddingBottom: SPACING.sm,
+  },
+  plusMenuFeaturedGradientBorder: {
+    borderRadius: 16,
+    padding: 1.5,
+  },
+  plusMenuFeaturedCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+    borderRadius: 14,
+    paddingHorizontal: SPACING.md,
+    paddingVertical: SPACING.md,
+  },
+  plusMenuFeaturedIcon: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
 });

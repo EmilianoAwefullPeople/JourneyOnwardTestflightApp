@@ -47,6 +47,20 @@ export function isTimestampInAlbumRange(
 }
 
 /**
+ * Returns true only once a trip is fully in the past — it has an endDate, and today is after
+ * it. Trips without an endDate are open-ended and are never "finished" until one is set.
+ * Recaps (Journey Recap, and the Recap card in "Recaps & Stories") are gated on this: a recap
+ * summarizes a trip, so it isn't offered until there's nothing left to summarize.
+ */
+export function isTripFinished(album: TripAlbum, nowTimestamp: string = new Date().toISOString()): boolean {
+  if (!album.endDate || album.endDate.trim() === '') return false;
+  const end = toDayEnd(album.endDate);
+  const now = new Date(nowTimestamp).getTime();
+  if (!Number.isFinite(end) || !Number.isFinite(now)) return false;
+  return now > end;
+}
+
+/**
  * Returns the first trip album whose date range contains the entry timestamp.
  * - If album has endDate: entry date must be >= startDate and <= endDate (inclusive).
  * - If album has no endDate: entry date must be >= startDate.

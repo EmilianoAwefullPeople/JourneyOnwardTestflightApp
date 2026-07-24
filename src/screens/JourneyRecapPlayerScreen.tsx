@@ -9,6 +9,8 @@ import { useAppContext } from '../context/AppContext';
 import { FONTS, SPACING } from '../config/constants';
 import { getRecapCandidates } from '../utils/recapCandidates';
 import { buildRecapSlides } from '../utils/recapBuilder';
+import { Analytics } from '../services/AnalyticsService';
+
 import {
   collectPreloadAssets,
   preloadAssets as preloadAssetsUtil,
@@ -176,13 +178,20 @@ const JourneyRecapPlayerScreen: React.FC = () => {
 
   const [currentIndex, setCurrentIndex] = useState(0);
   const slideOpacity = useRef(new Animated.Value(1)).current;
+  const viewStartTime = useRef(Date.now());
 
   const animateIn = useCallback(() => {
     slideOpacity.setValue(0);
     Animated.timing(slideOpacity, { toValue: 1, duration: 220, useNativeDriver: true }).start();
   }, [slideOpacity]);
 
-  const handleBack = useCallback(() => navigation.goBack(), [navigation]);
+  const handleBack = useCallback(() => {
+    if (albumId && slides.length > 0) {
+      const pct = currentIndex / slides.length;
+      Analytics.onRecapViewed(albumId, pct, false).catch(() => {});
+    }
+    navigation.goBack();
+  }, [navigation, albumId, currentIndex, slides.length]);
 
   const goNext = useCallback(() => {
     if (!albumId) return;
@@ -190,6 +199,7 @@ const JourneyRecapPlayerScreen: React.FC = () => {
       setCurrentIndex((i) => i + 1);
       animateIn();
     } else {
+      if (albumId) Analytics.onRecapViewed(albumId, 1.0, true).catch(() => {});
       navigation.navigate('JourneyRecapPost', { albumId });
     }
   }, [currentIndex, slides.length, albumId, navigation, animateIn]);

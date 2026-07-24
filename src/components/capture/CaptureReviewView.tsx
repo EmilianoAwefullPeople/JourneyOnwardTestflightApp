@@ -31,6 +31,7 @@ import { extractColorPalettesForEntry } from '../../services/ColorExtractionServ
 import * as PersistenceManager from '../../storage/PersistenceManager';
 import { findMatchingAlbumId } from '../../utils/albumUtils';
 import { logger } from '../../utils/logger';
+import { measurePhotoDimensionsFromUris } from '../../utils/galleryAspectRatio';
 
 type Props = {
   photos: string[];
@@ -146,6 +147,8 @@ const CaptureReviewView: React.FC<Props> = ({ photos, onBack, onSaved, exifTimes
         // Non-fatal: backfill service will generate thumbnails on next app session.
       }
 
+      const dimensionArrays = await measurePhotoDimensionsFromUris(resolvedForThumb);
+
       const timestamp = isPastExperience
         ? (exifTimestamp ?? new Date().toISOString())
         : new Date().toISOString();
@@ -170,7 +173,7 @@ const CaptureReviewView: React.FC<Props> = ({ photos, onBack, onSaved, exifTimes
         mediaPaths: persistentPaths,
         photoPaths: persistentPaths,
         thumbPaths,
-        storageUrls: [],
+        ...dimensionArrays,
         timestamp,
         latitude: resolvedLocation?.latitude,
         longitude: resolvedLocation?.longitude,
@@ -180,7 +183,7 @@ const CaptureReviewView: React.FC<Props> = ({ photos, onBack, onSaved, exifTimes
           ? { altitudeMeters: resolvedAltitude }
           : {}),
         isDraft: false,
-        isAwe: false,
+        isBookmarked: false,
       };
 
       if (resolvedLocation) {

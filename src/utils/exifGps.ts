@@ -122,6 +122,39 @@ function resolveGpsDict(exif: Record<string, unknown>): Record<string, unknown> 
 }
 
 /**
+ * Extracts altitude in meters above sea level from EXIF object.
+ * Handles iOS nested '{GPS}' format and standard flat GPSAltitude key.
+ * Returns null if data is missing, malformed, or not finite.
+ */
+export function getAltitudeFromExif(
+  exif: Record<string, unknown> | null | undefined
+): number | null {
+  try {
+    if (!exif || typeof exif !== 'object') return null;
+    const resolved = resolveGpsDict(exif);
+    const raw = resolved.GPSAltitude;
+    if (raw == null) return null;
+    let alt: number | null = null;
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+      alt = raw;
+    } else if (typeof raw === 'object' && 'numerator' in raw && 'denominator' in raw) {
+      const r = raw as { numerator: number; denominator: number };
+      if (Number(r.denominator) !== 0) alt = Number(r.numerator) / Number(r.denominator);
+    } else if (typeof raw === 'string') {
+      const n = parseFloat(raw);
+      if (Number.isFinite(n)) alt = n;
+    }
+    if (alt == null || !Number.isFinite(alt)) return null;
+    // GPSAltitudeRef: 0 = above sea level (default), 1 = below sea level
+    const ref = resolved.GPSAltitudeRef;
+    if (ref === 1 || ref === '1') alt = -alt;
+    return alt;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Extracts decimal latitude and longitude from EXIF object.
  * Handles DMS (degrees/minutes/seconds) and rational formats; applies GPSLatitudeRef / GPSLongitudeRef.
  * Supports both iOS nested '{GPS}' format and standard flat GPSLatitude/GPSLongitude keys.

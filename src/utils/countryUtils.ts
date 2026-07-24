@@ -140,6 +140,9 @@ const COUNTRY_NAME_TO_ISO: Record<string, string> = {
   'Macao': 'MO',
 };
 
+/** All known country display names, sorted, for pickers/autocomplete. */
+export const ALL_COUNTRY_NAMES: string[] = Object.keys(COUNTRY_NAME_TO_ISO).sort((a, b) => a.localeCompare(b));
+
 function resolveIsoForCountryName(trimmed: string): string | undefined {
   const code = COUNTRY_NAME_TO_ISO[trimmed] ?? COUNTRY_NAME_TO_ISO[trimmed.replace(/\s+/g, ' ')];
   if (code) return code;
@@ -148,21 +151,15 @@ function resolveIsoForCountryName(trimmed: string): string | undefined {
   return key ? COUNTRY_NAME_TO_ISO[key] : undefined;
 }
 
-export function getIsoCodeForCountryName(name: string): string | null {
-  if (!name || typeof name !== 'string') return null;
-  return resolveIsoForCountryName(name.trim()) ?? null;
-}
-
-export function getKnownCountryNames(): string[] {
-  // Collapse aliases that point to the same ISO code (e.g. "Laos" vs "Lao People's Democratic Republic").
-  // Keep the first encountered key as the display name; the map is ordered with common names first.
-  const preferredNameByIso = new Map<string, string>();
-  for (const [name, iso] of Object.entries(COUNTRY_NAME_TO_ISO)) {
-    if (!preferredNameByIso.has(iso)) {
-      preferredNameByIso.set(iso, name);
-    }
-  }
-  return Array.from(preferredNameByIso.values()).sort((a, b) => a.localeCompare(b));
+/**
+ * Maps a reverse-geocoded country name (as stored on Entry.country) to its
+ * ISO 3166-1 alpha-2 code, or undefined if unmapped. Used to match entries
+ * against the world map's per-country paths.
+ */
+export function getIsoForCountryName(countryName: string): string | undefined {
+  const trimmed = countryName?.trim();
+  if (!trimmed) return undefined;
+  return resolveIsoForCountryName(trimmed);
 }
 
 /**

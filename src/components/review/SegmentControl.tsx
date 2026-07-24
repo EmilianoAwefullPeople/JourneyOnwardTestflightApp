@@ -197,7 +197,7 @@ function SegmentControl({ activeSegment, onSegmentChange }: SegmentControlProps)
           onPress={() => handleSegmentPress('tripAlbums')}
           activeOpacity={0.7}
           accessibilityRole="button"
-          accessibilityLabel="Trip Albums"
+          accessibilityLabel="Your Trips"
           accessibilityState={{ selected: normalizedActive === 'tripAlbums' }}
         >
           <View style={styles.segmentContent}>
@@ -205,7 +205,7 @@ function SegmentControl({ activeSegment, onSegmentChange }: SegmentControlProps)
             {normalizedActive === 'tripAlbums' && (
               <ExpandingSegmentLabel
                 key="tripAlbums-label"
-                label="Trip Albums"
+                label="Your Trips"
                 textStyle={labelStyle}
                 durationMs={PILL_LAYOUT_ANIM_MS}
                 reduceMotion={reduceMotion}
@@ -241,6 +241,7 @@ function SegmentControl({ activeSegment, onSegmentChange }: SegmentControlProps)
             )}
           </View>
         </TouchableOpacity>
+
       </View>
     </View>
   );

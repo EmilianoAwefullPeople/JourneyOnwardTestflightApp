@@ -1,20 +1,20 @@
 {
   "expo": {
-    "name": "journeyon",
+    "name": "Journey Onward",
     "slug": "journeyon",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "splash": {
-      "image": "./assets/splash-icon.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#ffffff"
+      "image": "./assets/splash.png",
+      "resizeMode": "cover",
+      "backgroundColor": "#171717"
     },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.awefullpeople.journeyon",
-      "buildNumber": "10",
+      "buildNumber": "19",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }

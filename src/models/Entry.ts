@@ -3,13 +3,12 @@
 
 export interface Entry {
   id: string; // UUID
-  type: 'experience' | 'insight';
+  type: 'experience';
   title?: string;
   description: string;
   mediaType: 'photo' | 'audio' | 'video';
   photoPaths: string[]; // Array of local file URIs (backward compatible)
   mediaPaths: string[]; // Array of local file URIs for all media types
-  storageUrls: string[]; // Array of Supabase Storage URLs
   emotionLabels?: string[]; // Array of emotion labels (multi-select)
   emotionNote?: string; // Optional short text about how the user feels (emotion capture)
   timestamp: string; // ISO date string
@@ -26,11 +25,15 @@ export interface Entry {
   altitudeMeters?: number; // From device/Expo Location
   season?: 'spring' | 'summer' | 'autumn' | 'winter';
   isDraft: boolean;
-  isAwe?: boolean; // User tagged this experience as full of awe
+  isBookmarked?: boolean;
   /** Per-photo color palettes. colorPalettes[i] is 8 hex strings for photoPaths[i], most dominant first. */
   colorPalettes?: string[][];
   /** Per-photo thumbnail paths (400 px wide JPEG). thumbPaths[i] corresponds to photoPaths[i]. */
   thumbPaths?: string[];
+  /** Per-photo pixel widths. photoWidths[i] corresponds to photoPaths[i]; 0 = unknown. */
+  photoWidths?: number[];
+  /** Per-photo pixel heights. photoHeights[i] corresponds to photoPaths[i]; 0 = unknown. */
+  photoHeights?: number[];
   createdAt?: string; // ISO date string
   updatedAt?: string; // ISO date string
 }

@@ -11,9 +11,9 @@ import { logger } from '../utils/logger';
 import { deleteAllPersistentMedia, deletePersistentMediaForEntry, resolveMediaPath, toRelativePathArray } from './mediaStorage';
 
 /** Bump when adding migrations; must match highest version set by migrations / resetDatabase. */
-const TARGET_SCHEMA_VERSION = 15;
+const TARGET_SCHEMA_VERSION = 17;
 const REQUIRED_ENTRY_COLUMNS: Array<{ name: string; sql: string }> = [
-  { name: 'is_awe', sql: 'is_awe INTEGER' },
+  { name: 'is_bookmarked', sql: 'is_bookmarked INTEGER' },
   { name: 'weather', sql: 'weather TEXT' },
   { name: 'temperature_celsius', sql: 'temperature_celsius REAL' },
   { name: 'altitude_meters', sql: 'altitude_meters REAL' },
@@ -23,6 +23,8 @@ const REQUIRED_ENTRY_COLUMNS: Array<{ name: string; sql: string }> = [
   { name: 'city', sql: 'city TEXT' },
   { name: 'photo_color_palettes', sql: 'photo_color_palettes TEXT' },
   { name: 'thumb_paths', sql: 'thumb_paths TEXT' },
+  { name: 'photo_widths', sql: 'photo_widths TEXT' },
+  { name: 'photo_heights', sql: 'photo_heights TEXT' },
 ];
 
 // Lazy-load SQLite only when needed
@@ -156,8 +158,10 @@ const resetDatabase = async (database: any): Promise<void> => {
       city TEXT,
       photo_color_palettes TEXT,
       thumb_paths TEXT,
+      photo_widths TEXT,
+      photo_heights TEXT,
       is_draft INTEGER NOT NULL DEFAULT 0,
-      is_awe INTEGER,
+      is_bookmarked INTEGER,
       created_at TEXT,
       updated_at TEXT
     );
@@ -254,7 +258,7 @@ const resetDatabase = async (database: any): Promise<void> => {
     );
   `);
 
-  await setSchemaVersion(database, 15);
+  await setSchemaVersion(database, 17);
   logger.log('Database reset completed with clean schema');
 };
 
@@ -349,7 +353,7 @@ const rescueLegacySchema = async (database: any): Promise<void> => {
       city TEXT,
       photo_color_palettes TEXT,
       is_draft INTEGER NOT NULL DEFAULT 0,
-      is_awe INTEGER,
+      is_bookmarked INTEGER,
       created_at TEXT,
       updated_at TEXT
     );
@@ -373,7 +377,7 @@ const rescueLegacySchema = async (database: any): Promise<void> => {
           storage_urls, emotion_labels, emotion_note,
           timestamp, latitude, longitude, album_id, journal_id,
           weather, temperature_celsius, altitude_meters, season, country, city,
-          photo_color_palettes, is_draft, is_awe, created_at, updated_at
+          photo_color_palettes, is_draft, is_bookmarked, created_at, updated_at
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
           row.id, row.type, row.title ?? null, row.description,
@@ -386,7 +390,7 @@ const rescueLegacySchema = async (database: any): Promise<void> => {
           row.country ?? null,
           row.city ?? null,
           null, // photo_color_palettes — not in legacy schema
-          row.is_draft ?? 0, row.is_awe ?? null,
+          row.is_draft ?? 0, row.is_awe ?? null, // is_awe read from legacy, stored as is_bookmarked
           row.created_at ?? null, row.updated_at ?? null,
         ]
       );
@@ -803,6 +807,36 @@ const migrateDatabase = async (database: any): Promise<void> => {
       continue;
     }
 
+    if (currentVersion === 15) {
+      const hasIsAwe = await columnExists(database, 'entries', 'is_awe');
+      if (hasIsAwe) {
+        await database.execAsync('ALTER TABLE entries RENAME COLUMN is_awe TO is_bookmarked;');
+        logger.log('Migration 15→16: Renamed is_awe to is_bookmarked in entries');
+      }
+      await setSchemaVersion(database, 16);
+      currentVersion = 16;
+      logger.log('Migration 15→16 completed');
+      continue;
+    }
+
+    if (currentVersion === 16) {
+      const photoDimColumns: Array<{ name: string; sql: string }> = [
+        { name: 'photo_widths', sql: 'photo_widths TEXT' },
+        { name: 'photo_heights', sql: 'photo_heights TEXT' },
+      ];
+      for (const col of photoDimColumns) {
+        const exists = await columnExists(database, 'entries', col.name);
+        if (!exists) {
+          await database.execAsync(`ALTER TABLE entries ADD COLUMN ${col.sql};`);
+          logger.log(`Migration 16→17: Added ${col.name} column to entries`);
+        }
+      }
+      await setSchemaVersion(database, 17);
+      currentVersion = 17;
+      logger.log('Migration 16→17 completed');
+      continue;
+    }
+
     logger.warn('migrateDatabase: unhandled schema version, stopping', { currentVersion });
     break;
   }
@@ -893,6 +927,20 @@ export const getDatabaseSchemaVersion = async (): Promise<number> => {
   }
 };
 
+export const upsertOnboardingCompletion = async (path: 'unpack' | 'trip_album' | 'explore'): Promise<void> => {
+  const database = await getDatabase();
+  const now = new Date().toISOString();
+  await database.runAsync(
+    `INSERT INTO user_profile (id, name, onboarding_completed_at, onboarding_path_taken, created_at, updated_at)
+     VALUES ('local_user', '', ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       onboarding_completed_at = excluded.onboarding_completed_at,
+       onboarding_path_taken = excluded.onboarding_path_taken,
+       updated_at = excluded.updated_at`,
+    [now, path, now, now],
+  );
+};
+
 /**
  * Clears all app data (entries, journals, trip albums, user_profile). Used for "Restart app".
  * Does not close the DB connection; next reads will see empty tables.
@@ -901,89 +949,6 @@ export const clearAllData = async (): Promise<void> => {
   const database = await getDatabase();
   await resetDatabase(database);
   deleteAllPersistentMedia();
-};
-
-// User Profile Operations
-
-export const upsertUserProfile = async (profile: import('../models/UserProfile').UserProfile): Promise<void> => {
-  try {
-    const database = await getDatabase();
-    const now = new Date().toISOString();
-    await database.runAsync(
-      `INSERT INTO user_profile (
-        id, name, traveler_tier, intent, email, phone,
-        onboarding_completed_at, onboarding_path_taken,
-        tried_travel_mode, tried_journal_entry, tried_gallery_sync,
-        tried_trip_album, tried_journey_recap, tried_postcards,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        name = excluded.name,
-        traveler_tier = excluded.traveler_tier,
-        intent = excluded.intent,
-        email = excluded.email,
-        phone = excluded.phone,
-        onboarding_completed_at = excluded.onboarding_completed_at,
-        onboarding_path_taken = excluded.onboarding_path_taken,
-        tried_travel_mode = excluded.tried_travel_mode,
-        tried_journal_entry = excluded.tried_journal_entry,
-        tried_gallery_sync = excluded.tried_gallery_sync,
-        tried_trip_album = excluded.tried_trip_album,
-        tried_journey_recap = excluded.tried_journey_recap,
-        tried_postcards = excluded.tried_postcards,
-        updated_at = excluded.updated_at`,
-      [
-        profile.id,
-        profile.name,
-        profile.travelerTier ?? null,
-        stringify(profile.intent),
-        profile.email ?? null,
-        profile.phone ?? null,
-        profile.onboardingCompletedAt ?? null,
-        profile.onboardingPathTaken ?? null,
-        profile.triedTravelMode ? 1 : 0,
-        profile.triedJournalEntry ? 1 : 0,
-        profile.triedGallerySync ? 1 : 0,
-        profile.triedTripAlbum ? 1 : 0,
-        profile.triedJourneyRecap ? 1 : 0,
-        profile.triedPostcards ? 1 : 0,
-        profile.createdAt ?? now,
-        now,
-      ]
-    );
-  } catch (error) {
-    logger.error('Error upserting user profile:', error);
-    throw error;
-  }
-};
-
-export const getUserProfile = async (): Promise<import('../models/UserProfile').UserProfile | null> => {
-  try {
-    const database = await getDatabase();
-    const row: any = await database.getFirstAsync('SELECT * FROM user_profile LIMIT 1');
-    if (!row) return null;
-    return {
-      id: row.id,
-      name: row.name,
-      travelerTier: row.traveler_tier ?? undefined,
-      intent: parse(row.intent) ?? [],
-      email: row.email ?? undefined,
-      phone: row.phone ?? undefined,
-      onboardingCompletedAt: row.onboarding_completed_at ?? undefined,
-      onboardingPathTaken: row.onboarding_path_taken ?? undefined,
-      triedTravelMode: Boolean(row.tried_travel_mode),
-      triedJournalEntry: Boolean(row.tried_journal_entry),
-      triedGallerySync: Boolean(row.tried_gallery_sync),
-      triedTripAlbum: Boolean(row.tried_trip_album),
-      triedJourneyRecap: Boolean(row.tried_journey_recap),
-      triedPostcards: Boolean(row.tried_postcards),
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    };
-  } catch (error) {
-    logger.error('Error getting user profile:', error);
-    return null;
-  }
 };
 
 // Helper functions for JSON serialization
@@ -1003,6 +968,13 @@ const parse = (value: string | null): any => {
     }
     return undefined;
   }
+};
+
+const parsePhotoDimensionArray = (value: string | null | undefined): number[] | undefined => {
+  const parsed = parse(value ?? null);
+  if (!Array.isArray(parsed) || parsed.length === 0) return undefined;
+  const nums = parsed.map((v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0));
+  return nums.some((n) => n > 0) ? nums : undefined;
 };
 
 // Trip Album Operations
@@ -1053,21 +1025,31 @@ export const createTripAlbum = async (album: TripAlbum): Promise<void> => {
  */
 export const assignExistingItemsToAlbum = async (album: TripAlbum): Promise<void> => {
   try {
-    const entries = await getEntries();
-    const journals = await getJournals();
+    const database = await getDatabase();
     const albumId = album.id;
+    const now = new Date().toISOString();
 
-    for (const entry of entries) {
-      if (!entry.albumId && isTimestampInAlbumRange(entry.timestamp, album.startDate, album.endDate)) {
-        await updateEntry({ ...entry, albumId });
-      }
+    // Replicate isTimestampInAlbumRange local-day boundaries expressed as UTC ISO strings
+    // so they compare correctly against stored entry timestamps (which are also UTC ISO).
+    const sd = new Date(album.startDate);
+    const startBound = new Date(sd.getFullYear(), sd.getMonth(), sd.getDate(), 0, 0, 0, 0).toISOString();
+
+    let endBound: string;
+    if (album.endDate && album.endDate.trim() !== '') {
+      const ed = new Date(album.endDate);
+      endBound = new Date(ed.getFullYear(), ed.getMonth(), ed.getDate(), 23, 59, 59, 999).toISOString();
+    } else {
+      endBound = '9999-12-31T23:59:59.999Z';
     }
 
-    for (const journal of journals) {
-      if (!journal.albumId && isTimestampInAlbumRange(journal.timestamp, album.startDate, album.endDate)) {
-        await updateJournal({ ...journal, albumId });
-      }
-    }
+    await database.runAsync(
+      `UPDATE entries SET album_id = ?, updated_at = ? WHERE album_id IS NULL AND timestamp >= ? AND timestamp <= ?`,
+      [albumId, now, startBound, endBound]
+    );
+    await database.runAsync(
+      `UPDATE journals SET album_id = ?, updated_at = ? WHERE album_id IS NULL AND timestamp >= ? AND timestamp <= ?`,
+      [albumId, now, startBound, endBound]
+    );
   } catch (error) {
     logger.error('Error assigning existing items to album:', error);
     throw error;
@@ -1199,11 +1181,11 @@ export const createEntry = async (entry: Entry): Promise<void> => {
   const runInsert = async (database: any, now: string) =>
     database.runAsync(
       `INSERT INTO entries (
-        id, type, title, description, media_type, photo_paths, media_paths, storage_urls,
+        id, type, title, description, media_type, photo_paths, media_paths,
         emotion_labels, emotion_note, timestamp, latitude, longitude,
         album_id, journal_id, weather, temperature_celsius, altitude_meters, season, country, city,
-        photo_color_palettes, thumb_paths, is_draft, is_awe, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        photo_color_palettes, thumb_paths, photo_widths, photo_heights, is_draft, is_bookmarked, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         entry.id,
         entry.type,
@@ -1212,7 +1194,6 @@ export const createEntry = async (entry: Entry): Promise<void> => {
         entry.mediaType,
         stringify(toRelativePathArray(entry.photoPaths)),
         stringify(toRelativePathArray(entry.mediaPaths)),
-        stringify(entry.storageUrls),
         stringify(entry.emotionLabels),
         entry.emotionNote ?? null,
         entry.timestamp,
@@ -1228,8 +1209,10 @@ export const createEntry = async (entry: Entry): Promise<void> => {
         entry.city?.trim() || null,
         stringify(entry.colorPalettes),
         stringify(toRelativePathArray(entry.thumbPaths ?? [])),
+        stringify(entry.photoWidths),
+        stringify(entry.photoHeights),
         entry.isDraft ? 1 : 0,
-        entry.isAwe ? 1 : 0,
+        entry.isBookmarked ? 1 : 0,
         now,
         now,
       ]
@@ -1271,7 +1254,6 @@ export const getEntries = async (): Promise<Entry[]> => {
       mediaType: row.media_type,
       photoPaths: (parse(row.photo_paths) || []).map(resolveMediaPath),
       mediaPaths: (parse(row.media_paths) || []).map(resolveMediaPath),
-      storageUrls: parse(row.storage_urls) || [],
       emotionLabels: parse(row.emotion_labels),
       emotionNote: row.emotion_note ?? undefined,
       timestamp: row.timestamp,
@@ -1287,8 +1269,10 @@ export const getEntries = async (): Promise<Entry[]> => {
       city: row.city != null && String(row.city).trim() !== '' ? String(row.city).trim() : undefined,
       colorPalettes: parse(row.photo_color_palettes) ?? undefined,
       thumbPaths: (parse(row.thumb_paths) || []).map(resolveMediaPath).filter(Boolean),
+      photoWidths: parsePhotoDimensionArray(row.photo_widths),
+      photoHeights: parsePhotoDimensionArray(row.photo_heights),
       isDraft: row.is_draft === 1,
-      isAwe: row.is_awe === 1,
+      isBookmarked: row.is_bookmarked === 1,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     }));
@@ -1321,7 +1305,6 @@ const rowToEntry = (row: any): Entry => ({
   mediaType: row.media_type,
   photoPaths: (parse(row.photo_paths) || []).map(resolveMediaPath),
   mediaPaths: (parse(row.media_paths) || []).map(resolveMediaPath),
-  storageUrls: parse(row.storage_urls) || [],
   emotionLabels: parse(row.emotion_labels),
   emotionNote: row.emotion_note ?? undefined,
   timestamp: row.timestamp,
@@ -1337,8 +1320,10 @@ const rowToEntry = (row: any): Entry => ({
   city: row.city != null && String(row.city).trim() !== '' ? String(row.city).trim() : undefined,
   colorPalettes: parse(row.photo_color_palettes) ?? undefined,
   thumbPaths: (parse(row.thumb_paths) || []).map(resolveMediaPath).filter(Boolean),
+  photoWidths: parsePhotoDimensionArray(row.photo_widths),
+  photoHeights: parsePhotoDimensionArray(row.photo_heights),
   isDraft: row.is_draft === 1,
-  isAwe: row.is_awe === 1,
+  isBookmarked: row.is_bookmarked === 1,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
 });
@@ -1445,7 +1430,6 @@ export const getEntryById = async (id: string): Promise<Entry | null> => {
       mediaType: row.media_type,
       photoPaths: (parse(row.photo_paths) || []).map(resolveMediaPath),
       mediaPaths: (parse(row.media_paths) || []).map(resolveMediaPath),
-      storageUrls: parse(row.storage_urls) || [],
       emotionLabels: parse(row.emotion_labels),
       emotionNote: row.emotion_note ?? undefined,
       timestamp: row.timestamp,
@@ -1460,8 +1444,11 @@ export const getEntryById = async (id: string): Promise<Entry | null> => {
       country: row.country != null && String(row.country).trim() !== '' ? String(row.country).trim() : undefined,
       city: row.city != null && String(row.city).trim() !== '' ? String(row.city).trim() : undefined,
       colorPalettes: parse(row.photo_color_palettes) ?? undefined,
+      thumbPaths: (parse(row.thumb_paths) || []).map(resolveMediaPath).filter(Boolean),
+      photoWidths: parsePhotoDimensionArray(row.photo_widths),
+      photoHeights: parsePhotoDimensionArray(row.photo_heights),
       isDraft: row.is_draft === 1,
-      isAwe: row.is_awe === 1,
+      isBookmarked: row.is_bookmarked === 1,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -1479,10 +1466,10 @@ export const updateEntry = async (entry: Entry): Promise<void> => {
     await database.runAsync(
       `UPDATE entries SET
         type = ?, title = ?, description = ?, media_type = ?, photo_paths = ?,
-        media_paths = ?, storage_urls = ?, emotion_labels = ?, emotion_note = ?,
+        media_paths = ?, emotion_labels = ?, emotion_note = ?,
         timestamp = ?, latitude = ?, longitude = ?, album_id = ?,
         journal_id = ?, weather = ?, temperature_celsius = ?, altitude_meters = ?, season = ?, country = ?, city = ?,
-        photo_color_palettes = ?, thumb_paths = ?, is_draft = ?, is_awe = ?, updated_at = ?
+        photo_color_palettes = ?, thumb_paths = ?, photo_widths = ?, photo_heights = ?, is_draft = ?, is_bookmarked = ?, updated_at = ?
       WHERE id = ?`,
       [
         entry.type,
@@ -1491,7 +1478,6 @@ export const updateEntry = async (entry: Entry): Promise<void> => {
         entry.mediaType,
         stringify(toRelativePathArray(entry.photoPaths)),
         stringify(toRelativePathArray(entry.mediaPaths)),
-        stringify(entry.storageUrls),
         stringify(entry.emotionLabels),
         entry.emotionNote ?? null,
         entry.timestamp,
@@ -1507,8 +1493,10 @@ export const updateEntry = async (entry: Entry): Promise<void> => {
         entry.city?.trim() || null,
         stringify(entry.colorPalettes),
         stringify(toRelativePathArray(entry.thumbPaths ?? [])),
+        stringify(entry.photoWidths),
+        stringify(entry.photoHeights),
         entry.isDraft ? 1 : 0,
-        entry.isAwe ? 1 : 0,
+        entry.isBookmarked ? 1 : 0,
         now,
         entry.id,
       ]
@@ -1606,6 +1594,22 @@ export const getEntriesMissingThumbs = async (limit = 10): Promise<Entry[]> => {
   }
 };
 
+export const getEntriesByIds = async (ids: string[]): Promise<Entry[]> => {
+  if (ids.length === 0) return [];
+  try {
+    const database = await getDatabase();
+    const placeholders = ids.map(() => '?').join(',');
+    const result = await database.getAllAsync(
+      `SELECT * FROM entries WHERE id IN (${placeholders})`,
+      ids
+    );
+    return (result as any[]).map(rowToEntry);
+  } catch (error) {
+    logger.error('Error getting entries by ids:', error);
+    return [];
+  }
+};
+
 /** Updates only thumb_paths for one entry. Used by thumbnail backfill and capture flow. */
 export const updateEntryThumbPaths = async (id: string, thumbPaths: string[]): Promise<void> => {
   try {
@@ -1616,6 +1620,45 @@ export const updateEntryThumbPaths = async (id: string, thumbPaths: string[]): P
     );
   } catch (error) {
     logger.error('Error updating entry thumb paths:', error);
+    throw error;
+  }
+};
+
+/** Photo entries missing stored pixel dimensions. Used by photo dimension backfill. */
+export const getEntriesMissingPhotoDimensions = async (limit = 10): Promise<Entry[]> => {
+  try {
+    const database = await getDatabase();
+    const result = await database.getAllAsync(
+      `SELECT * FROM entries
+       WHERE media_type = 'photo'
+         AND photo_paths IS NOT NULL AND photo_paths != '' AND photo_paths != '[]'
+         AND (photo_widths IS NULL OR photo_widths = '' OR photo_widths = '[]')
+         AND is_draft = 0
+       ORDER BY timestamp DESC
+       LIMIT ?`,
+      [limit]
+    );
+    return (result as any[]).map(rowToEntry);
+  } catch (error) {
+    logger.error('Error getting entries missing photo dimensions:', error);
+    return [];
+  }
+};
+
+/** Updates only photo_widths / photo_heights for one entry. */
+export const updateEntryPhotoDimensions = async (
+  id: string,
+  photoWidths: number[],
+  photoHeights: number[]
+): Promise<void> => {
+  try {
+    const database = await getDatabase();
+    await database.runAsync(
+      'UPDATE entries SET photo_widths = ?, photo_heights = ?, updated_at = ? WHERE id = ?',
+      [stringify(photoWidths), stringify(photoHeights), new Date().toISOString(), id]
+    );
+  } catch (error) {
+    logger.error('Error updating entry photo dimensions:', error);
     throw error;
   }
 };
@@ -1853,13 +1896,13 @@ export const createPostcard = async (postcard: Postcard): Promise<void> => {
         postcard.updatedAt,
         postcard.templateId,
         postcard.aspectRatio,
-        postcard.topPhotoPath ?? null,
-        postcard.bottomPhotoPath ?? null,
-        postcard.topLabel,
-        postcard.bottomLabel,
+        postcard.photo1Path ?? null,
+        postcard.photo2Path ?? null,
+        postcard.label1,
+        postcard.label2,
         postcard.downloaded ? 1 : 0,
-        postcard.topPhotoTransform != null ? stringify(postcard.topPhotoTransform) : null,
-        postcard.bottomPhotoTransform != null ? stringify(postcard.bottomPhotoTransform) : null,
+        postcard.photo1Transform != null ? stringify(postcard.photo1Transform) : null,
+        postcard.photo2Transform != null ? stringify(postcard.photo2Transform) : null,
         postcard.photo3Path ?? null,
         postcard.photo3Transform != null ? stringify(postcard.photo3Transform) : null,
         postcard.photo4Path ?? null,
@@ -1887,13 +1930,13 @@ export const updatePostcard = async (postcard: Postcard): Promise<void> => {
         postcard.updatedAt,
         postcard.templateId,
         postcard.aspectRatio,
-        postcard.topPhotoPath ?? null,
-        postcard.bottomPhotoPath ?? null,
-        postcard.topLabel,
-        postcard.bottomLabel,
+        postcard.photo1Path ?? null,
+        postcard.photo2Path ?? null,
+        postcard.label1,
+        postcard.label2,
         postcard.downloaded ? 1 : 0,
-        postcard.topPhotoTransform != null ? stringify(postcard.topPhotoTransform) : null,
-        postcard.bottomPhotoTransform != null ? stringify(postcard.bottomPhotoTransform) : null,
+        postcard.photo1Transform != null ? stringify(postcard.photo1Transform) : null,
+        postcard.photo2Transform != null ? stringify(postcard.photo2Transform) : null,
         postcard.photo3Path ?? null,
         postcard.photo3Transform != null ? stringify(postcard.photo3Transform) : null,
         postcard.photo4Path ?? null,
@@ -1920,13 +1963,13 @@ export const getPostcards = async (): Promise<Postcard[]> => {
       updatedAt: row.updated_at,
       templateId: row.template_id,
       aspectRatio: row.aspect_ratio as Postcard['aspectRatio'],
-      topPhotoPath: row.top_photo_path ?? null,
-      bottomPhotoPath: row.bottom_photo_path ?? null,
-      topLabel: row.top_label ?? '',
-      bottomLabel: row.bottom_label ?? '',
+      photo1Path: row.top_photo_path ?? null,
+      photo2Path: row.bottom_photo_path ?? null,
+      label1: row.top_label ?? '',
+      label2: row.bottom_label ?? '',
       downloaded: row.downloaded === 1,
-      topPhotoTransform: parsePostcardPhotoTransform(row.top_photo_transform),
-      bottomPhotoTransform: parsePostcardPhotoTransform(row.bottom_photo_transform),
+      photo1Transform: parsePostcardPhotoTransform(row.top_photo_transform),
+      photo2Transform: parsePostcardPhotoTransform(row.bottom_photo_transform),
       photo3Path: row.photo3_path ?? null,
       photo3Transform: parsePostcardPhotoTransform(row.photo3_transform),
       photo4Path: row.photo4_path ?? null,

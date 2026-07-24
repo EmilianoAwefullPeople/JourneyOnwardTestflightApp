@@ -4,27 +4,8 @@ import { Ionicons } from '@expo/vector-icons';
 import AppText from '../../common/AppText';
 import { PostcardFramedPhotoSlot } from '../PostcardFramedPhotoSlot';
 import type { TemplateBaseProps } from './sharedTypes';
-import {
-  entryTempString,
-  entryAltString,
-  entryWeatherString,
-  entrySeasonString,
-  entryDestination,
-} from './sharedTypes';
 import { FONTS } from '../../../config/constants';
-import type { Entry } from '../../../models/Entry';
-
-function getStripText(entry: Entry | null): string {
-  if (!entry) return '';
-  return (
-    entryTempString(entry) ??
-    entryAltString(entry) ??
-    entryWeatherString(entry) ??
-    entrySeasonString(entry) ??
-    entryDestination(entry) ??
-    ''
-  );
-}
+import { getStripTextForCategory, parseDataCategory } from './triptychStampsUtils';
 
 const T06VerticalTriptychTemplate = React.forwardRef<View, TemplateBaseProps>(
   (
@@ -33,6 +14,7 @@ const T06VerticalTriptychTemplate = React.forwardRef<View, TemplateBaseProps>(
       onSlotPress,
       onTransformChange,
       onResetSlotFraming,
+      templateData,
       aspectRatio = 9 / 16,
       editingChromeSuppressed = false,
       previewMode = false,
@@ -42,6 +24,7 @@ const T06VerticalTriptychTemplate = React.forwardRef<View, TemplateBaseProps>(
   ) => {
     const clampedScale = Math.max(0.3, Math.min(1, scale));
     const s = (v: number) => Math.max(1, Math.round(v * clampedScale));
+    const dataCategory = parseDataCategory(templateData);
 
     const defaultSlot = { photoUri: null, transform: { scale: 1, translateX: 0, translateY: 0 }, resetKey: 0, entry: null };
     const slot0 = slots[0] ?? defaultSlot;
@@ -52,13 +35,13 @@ const T06VerticalTriptychTemplate = React.forwardRef<View, TemplateBaseProps>(
     const emptyIconSize = Math.max(14, Math.round(22 * clampedScale));
 
     const renderStrip = (slotData: typeof slot0, index: number) => {
-      const stripText = getStripText(slotData.entry);
+      const stripText = getStripTextForCategory(slotData.entry, dataCategory);
 
       return (
         <View style={st.strip} key={index}>
           {slotData.photoUri ? (
             <>
-              {previewMode || editingChromeSuppressed ? (
+              {previewMode ? (
                 <Image source={{ uri: slotData.photoUri }} style={StyleSheet.absoluteFill} resizeMode="cover" />
               ) : (
                 <PostcardFramedPhotoSlot
@@ -110,7 +93,7 @@ const T06VerticalTriptychTemplate = React.forwardRef<View, TemplateBaseProps>(
                 style={{
                   fontFamily: FONTS.inter,
                   fontWeight: '700',
-                  fontSize: s(56),
+                  fontSize: s(30),
                   color: '#fff',
                   textAlign: 'center',
                   textShadowColor: 'rgba(0,0,0,0.55)',

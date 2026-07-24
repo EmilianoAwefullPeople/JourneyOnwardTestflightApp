@@ -19,20 +19,45 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
+import { useNavigation, useRoute, RouteProp, CommonActions } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation/types';
 import { FONTS, FONT_WEIGHTS, SPACING } from '../config/constants';
 import { useAppContext } from '../context/AppContext';
 import { DEFAULT_POSTCARD_PHOTO_TRANSFORM } from '../models/Postcard';
+import type { Entry } from '../models/Entry';
 import { logger } from '../utils/logger';
+import { Analytics } from '../services/AnalyticsService';
+import { deriveDiptychLabels } from '../components/postcards/templates/diptychCaptionUtils';
+
 
 const { width: SW } = Dimensions.get('window');
 
 type Nav = NativeStackNavigationProp<RootStackParamList, 'JourneyRecapPost'>;
 type Route = RouteProp<RootStackParamList, 'JourneyRecapPost'>;
 
-function getPhotoUri(entry: { photoPaths?: string[]; mediaPaths?: string[]; storageUrls?: string[] }): string | null {
+// Ordered list of templates to show in the recap carousel.
+// Each entry defines which template to use and how many photos it consumes.
+// Templates are sorted by photo count (fewest first) so the carousel starts
+// with single-photo cards and progresses to richer layouts.
+// minPhotos: minimum distinct photos required to show the card (defaults to photosToUse).
+const RECAP_TEMPLATE_SPECS: Array<{ id: string; photosToUse: number; minPhotos?: number }> = [
+  { id: 'T-02', photosToUse: 1 }, // Camera Frame
+  { id: 'T-03', photosToUse: 1 }, // Statement Card
+  { id: 'T-11', photosToUse: 2 }, // Diptych (T-11 / T11DiptychTemplate)
+  { id: 'T-05', photosToUse: 1 }, // iMessage Thread
+  { id: 'T-06', photosToUse: 3 }, // Triptych Stamps
+  { id: 'T-01', photosToUse: 4 }, // Quad Collage
+];
+
+interface RecapCardSpec {
+  templateId: string;
+  photos: string[];
+  locations: string[];
+  entries: Entry[];
+}
+
+function getPhotoUri(entry: { photoPaths?: string[]; mediaPaths?: string[] }): string | null {
   const paths = entry.photoPaths?.length
     ? entry.photoPaths
     : (entry.mediaPaths ?? []);
@@ -45,30 +70,125 @@ function getLocation(entry: { city?: string; country?: string }): string {
   return '';
 }
 
-interface PostcardData {
-  topPhoto: string;
-  bottomPhoto: string;
-  topLabel: string;
-  bottomLabel: string;
+/**
+ * Build one card spec per eligible template. Photos are distributed across
+ * cards with a cyclic offset so different templates show different photos.
+ */
+function buildRecapCards(
+  photoEntries: Array<{ photoUri: string; location: string; entry: Entry }>
+): RecapCardSpec[] {
+  if (photoEntries.length === 0) return [];
+  const result: RecapCardSpec[] = [];
+  let offset = 0;
+  for (const spec of RECAP_TEMPLATE_SPECS) {
+    const { id, photosToUse } = spec;
+    const minRequired = spec.minPhotos ?? photosToUse;
+    if (photoEntries.length < minRequired) continue;
+    const photos: string[] = [];
+    const locations: string[] = [];
+    const entries: Entry[] = [];
+    for (let i = 0; i < photosToUse; i++) {
+      const pe = photoEntries[(offset + i) % photoEntries.length];
+      photos.push(pe.photoUri);
+      locations.push(pe.location);
+      entries.push(pe.entry);
+    }
+    result.push({ templateId: id, photos, locations, entries });
+    offset = (offset + photosToUse) % photoEntries.length;
+  }
+  return result;
 }
 
-function buildPostcards(
-  photoEntries: Array<{ photoUri: string; location: string }>
-): PostcardData[] {
-  const n = Math.min(6, Math.max(2, Math.ceil(photoEntries.length / 2)));
-  return Array.from({ length: n }, (_, i) => {
-    const top = photoEntries[i * 2] ?? photoEntries[0];
-    const bottom = photoEntries[i * 2 + 1] ?? photoEntries[0];
-    return {
-      topPhoto: top.photoUri,
-      bottomPhoto: bottom.photoUri,
-      topLabel: top.location,
-      bottomLabel: bottom.location,
-    };
-  });
+/** Lazy-load the component for a given template ID. */
+function loadTemplateComponent(templateId: string): React.ComponentType<any> | null {
+  try {
+    switch (templateId) {
+      case 'T-01':
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        return require('../components/postcards/templates/T01QuadCollageTemplate').default;
+      case 'T-02':
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        return require('../components/postcards/templates/T02CameraViewfinderTemplate').default;
+      case 'T-03':
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        return require('../components/postcards/templates/T03StatementCardTemplate').default;
+      case 'T-05':
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        return require('../components/postcards/templates/T05iMessageTemplate').default;
+      case 'T-06':
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        return require('../components/postcards/templates/T06VerticalTriptychTemplate').default;
+      case 'T-11':
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        return require('../components/postcards/templates/T11DiptychTemplate').default;
+      default:
+        return null;
+    }
+  } catch (err) {
+    logger.warn('JourneyRecapPostScreen: failed to load template', { templateId, err });
+    return null;
+  }
 }
 
 const NOOP = () => {};
+const ASPECT_RATIO = 4 / 5;
+
+/** A single postcard card in the carousel, rendering the correct template. */
+const RecapCard = React.forwardRef<
+  View,
+  { spec: RecapCardSpec }
+>(({ spec }, ref) => {
+  const { templateId, photos, locations, entries } = spec;
+  const Component = useMemo(() => loadTemplateComponent(templateId), [templateId]);
+  if (!Component) return null;
+
+  const defaultTransform = { ...DEFAULT_POSTCARD_PHOTO_TRANSFORM };
+
+  if (templateId === 'T-11') {
+    const [topLabel, bottomLabel] = deriveDiptychLabels(entries[0], entries[1]);
+    return (
+      <Component
+        ref={ref}
+        topPhoto={photos[0] ?? null}
+        bottomPhoto={photos[1] ?? null}
+        topLabel={topLabel || locations[0] || ''}
+        bottomLabel={bottomLabel || locations[1] || ''}
+        topTransform={defaultTransform}
+        bottomTransform={defaultTransform}
+        onTopTransformChange={NOOP}
+        onBottomTransformChange={NOOP}
+        onSlotPress={NOOP}
+        onLabelPress={NOOP}
+        onResetSlotFraming={NOOP}
+        previewMode
+        editingChromeSuppressed
+        aspectRatio={ASPECT_RATIO}
+      />
+    );
+  }
+
+  const slots = photos.map((photoUri, i) => ({
+    photoUri,
+    transform: { ...DEFAULT_POSTCARD_PHOTO_TRANSFORM },
+    resetKey: 0,
+    entry: entries[i] ?? null,
+  }));
+
+  return (
+    <Component
+      ref={ref}
+      slots={slots}
+      onSlotPress={NOOP}
+      onTransformChange={NOOP}
+      onResetSlotFraming={NOOP}
+      templateData={{}}
+      onTemplateDataChange={NOOP}
+      aspectRatio={ASPECT_RATIO}
+      editingChromeSuppressed
+      previewMode
+    />
+  );
+});
 
 const JourneyRecapPostScreen: React.FC = () => {
   const navigation = useNavigation<Nav>();
@@ -76,14 +196,6 @@ const JourneyRecapPostScreen: React.FC = () => {
   const insets = useSafeAreaInsets();
   const { entries, tripAlbums } = useAppContext();
   const albumId = route.params?.albumId;
-
-  // Lazy-load heavy deps (view-shot, sharing, template) following the app's pattern
-  const C = useMemo(
-    () => ({
-      Template: require('../components/postcards/templates/TwoPhotoStackTemplate').default,
-    }),
-    []
-  );
 
   const album = useMemo(
     () => (albumId && tripAlbums ? tripAlbums.find((a) => a.id === albumId) : null),
@@ -100,20 +212,21 @@ const JourneyRecapPostScreen: React.FC = () => {
       .map((e) => ({
         photoUri: getPhotoUri(e)!,
         location: getLocation(e),
-        isAwe: e.isAwe === true,
+        isBookmarked: e.isBookmarked === true,
+        entry: e,
       }));
-    const awe = items.filter((p) => p.isAwe);
-    const rest = items.filter((p) => !p.isAwe);
-    return [...awe, ...rest]
+    const bookmarked = items.filter((p) => p.isBookmarked);
+    const rest = items.filter((p) => !p.isBookmarked);
+    return [...bookmarked, ...rest]
       .slice(0, 12)
-      .map(({ photoUri, location }) => ({ photoUri, location }));
+      .map(({ photoUri, location, entry }) => ({ photoUri, location, entry }));
   }, [albumId, entries]);
 
-  const postcards = useMemo(() => buildPostcards(photoEntries), [photoEntries]);
+  const cards = useMemo(() => buildRecapCards(photoEntries), [photoEntries]);
 
   const [currentCard, setCurrentCard] = useState(0);
   const [sharing, setSharing] = useState(false);
-  const templateRefs = useRef<(View | null)[]>([]);
+  const cardRefs = useRef<(View | null)[]>([]);
 
   const handleScroll = useCallback(
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
@@ -124,12 +237,11 @@ const JourneyRecapPostScreen: React.FC = () => {
   );
 
   const handleShare = useCallback(async () => {
-    const ref = templateRefs.current[currentCard];
+    const ref = cardRefs.current[currentCard];
     if (!ref) return;
     setSharing(true);
     try {
       const { captureRef } = require('react-native-view-shot');
-      // Allow layout to settle before capture
       await new Promise<void>((resolve) =>
         requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
       );
@@ -140,10 +252,8 @@ const JourneyRecapPostScreen: React.FC = () => {
       });
 
       if (Platform.OS === 'ios') {
-        // iOS Share sheet accepts file URIs directly
         await Share.share({ url: uri });
       } else {
-        // Android: save to camera roll as fallback
         const MediaLibrary = require('expo-media-library');
         const { status } = await MediaLibrary.requestPermissionsAsync(true);
         if (status === 'granted') {
@@ -153,13 +263,14 @@ const JourneyRecapPostScreen: React.FC = () => {
           Alert.alert('Permission needed', 'Allow access to save photos in Settings.');
         }
       }
+      Analytics.onPostcardExported(albumId ?? null).catch(() => {});
     } catch (err) {
       logger.warn('JourneyRecapPostScreen: share failed', err);
       Alert.alert('Error', 'Something went wrong. Please try again.');
     } finally {
       setSharing(false);
     }
-  }, [currentCard]);
+  }, [currentCard, albumId]);
 
   const handleReplay = useCallback(() => {
     if (!albumId) return;
@@ -172,13 +283,23 @@ const JourneyRecapPostScreen: React.FC = () => {
 
   const handleBack = useCallback(() => {
     try {
-      navigation.navigate('MainTabs', { screen: 'Home' });
+      if (albumId) {
+        navigation.dispatch(
+          CommonActions.reset({
+            index: 1,
+            routes: [
+              { name: 'MainTabs', params: { screen: 'Review' } },
+              { name: 'TripAlbumDetail', params: { albumId } },
+            ],
+          })
+        );
+      } else {
+        navigation.navigate('MainTabs', { screen: 'Home' });
+      }
     } catch {
       navigation.goBack();
     }
-  }, [navigation]);
-
-  const { Template } = C;
+  }, [navigation, albumId]);
 
   const styles = useMemo(
     () =>
@@ -220,7 +341,7 @@ const JourneyRecapPostScreen: React.FC = () => {
         },
         templateWrap: {
           width: SW - 56,
-          aspectRatio: 4 / 5,
+          aspectRatio: ASPECT_RATIO,
         },
         dotsRow: {
           flexDirection: 'row',
@@ -264,7 +385,7 @@ const JourneyRecapPostScreen: React.FC = () => {
     [insets]
   );
 
-  if (!album || postcards.length === 0) {
+  if (!album || cards.length === 0) {
     return (
       <View style={[styles.container, { alignItems: 'center', justifyContent: 'center' }]}>
         <Text style={{ color: 'rgba(255,255,255,0.5)', fontFamily: FONTS.inter, fontSize: 15 }}>
@@ -272,7 +393,7 @@ const JourneyRecapPostScreen: React.FC = () => {
         </Text>
         <TouchableOpacity onPress={handleBack} style={{ marginTop: 24 }} activeOpacity={0.7}>
           <Text style={{ color: 'rgba(255,255,255,0.4)', fontFamily: FONTS.inter, fontSize: 14 }}>
-            Back to home
+            Go to your trip
           </Text>
         </TouchableOpacity>
       </View>
@@ -281,7 +402,6 @@ const JourneyRecapPostScreen: React.FC = () => {
 
   return (
     <View style={styles.container}>
-      {/* Top bar */}
       <View style={styles.topBar}>
         <TouchableOpacity onPress={handleBack} activeOpacity={0.7} accessibilityRole="button" accessibilityLabel="Done">
           <Text style={styles.doneText}>Done</Text>
@@ -290,7 +410,6 @@ const JourneyRecapPostScreen: React.FC = () => {
         <View style={styles.spacer} />
       </View>
 
-      {/* Postcard carousel */}
       <View style={styles.carouselWrap}>
         <ScrollView
           horizontal
@@ -299,38 +418,23 @@ const JourneyRecapPostScreen: React.FC = () => {
           onMomentumScrollEnd={handleScroll}
           scrollEventThrottle={16}
         >
-          {postcards.map((card, i) => (
-            <View key={i} style={styles.cardPage}>
+          {cards.map((card, i) => (
+            <View key={`${card.templateId}-${i}`} style={styles.cardPage}>
               <View style={styles.templateWrap}>
-                <Template
-                  ref={(el: View | null) => {
-                    templateRefs.current[i] = el;
+                <RecapCard
+                  ref={(el) => {
+                    cardRefs.current[i] = el;
                   }}
-                  topPhoto={card.topPhoto}
-                  bottomPhoto={card.bottomPhoto}
-                  topLabel={card.topLabel}
-                  bottomLabel={card.bottomLabel}
-                  topTransform={DEFAULT_POSTCARD_PHOTO_TRANSFORM}
-                  bottomTransform={DEFAULT_POSTCARD_PHOTO_TRANSFORM}
-                  onTopTransformChange={NOOP}
-                  onBottomTransformChange={NOOP}
-                  onSlotPress={NOOP}
-                  onLabelPress={NOOP}
-                  onResetSlotFraming={NOOP}
-                  previewMode
-                  editingChromeSuppressed
-                  hideFooter={false}
-                  aspectRatio={4 / 5}
+                  spec={card}
                 />
               </View>
             </View>
           ))}
         </ScrollView>
 
-        {/* Page dots */}
-        {postcards.length > 1 && (
+        {cards.length > 1 && (
           <View style={styles.dotsRow}>
-            {postcards.map((_, i) => (
+            {cards.map((_, i) => (
               <View
                 key={i}
                 style={[
@@ -349,7 +453,6 @@ const JourneyRecapPostScreen: React.FC = () => {
         )}
       </View>
 
-      {/* Bottom actions */}
       <View style={styles.bottomArea}>
         <TouchableOpacity
           style={styles.shareButton}

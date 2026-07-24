@@ -10,6 +10,7 @@ import { EntryPhotoImage } from '../common/EntryPhotoImage';
 import { Entry } from '../../models/Entry';
 import MoreIcon from '../common/icons/MoreIcon';
 import GradientText from '../common/GradientText';
+import { getGalleryAspectRatio, getGalleryCardHeight } from '../../utils/galleryAspectRatio';
 
 interface PinterestGridProps {
   entries: Entry[];
@@ -121,11 +122,7 @@ const PinterestGrid: React.FC<PinterestGridProps> = ({ entries, onEntryPress }) 
     let rightHeight = 0;
 
     entries.forEach((entry) => {
-      // Calculate entry height (same logic as in renderItem)
-      const seed = entry.id.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
-      const randomFactor = (seed % 100) / 100;
-      const aspectRatio = 0.75 + (randomFactor * 0.9);
-      const cardHeight = cardWidth * aspectRatio;
+      const cardHeight = getGalleryCardHeight(cardWidth, entry);
       // Add title height if present (estimate ~40px for title + padding)
       const titleHeight = entry.title ? 40 : 0;
       const totalHeight = cardHeight + titleHeight + 8; // +8 for marginBottom
@@ -147,11 +144,7 @@ const PinterestGrid: React.FC<PinterestGridProps> = ({ entries, onEntryPress }) 
   const renderCard = (entry: Entry) => {
     const entryIndex = entryIndexMap.get(entry.id) ?? 0;
     const priority = entryIndex < 6 ? 'high' : entryIndex < 12 ? 'normal' : 'low';
-
-    const seed = entry.id.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
-    const randomFactor = (seed % 100) / 100; // 0 to 1
-    // Vary aspect ratio from 0.75 (wide/square-ish) to 1.65 (tall portrait) for more noticeable height variation
-    const aspectRatio = 0.75 + (randomFactor * 0.9);
+    const aspectRatio = getGalleryAspectRatio(entry);
 
     return (
       <TouchableOpacity
@@ -195,7 +188,7 @@ const PinterestGrid: React.FC<PinterestGridProps> = ({ entries, onEntryPress }) 
 
         {/* Title - bookmarked: gradient; non-bookmarked: plain text */}
         {entry.title ? (
-          entry.isAwe ? (
+          entry.isBookmarked ? (
             <GradientText style={styles.pinterestTitle}>
               {entry.title}
             </GradientText>

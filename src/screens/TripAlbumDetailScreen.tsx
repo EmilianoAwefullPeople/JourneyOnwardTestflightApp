@@ -9,16 +9,17 @@ import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation/types';
 import { useAppContext } from '../context/AppContext';
-import { COLORS, SPACING, FONTS, FONT_WEIGHTS } from '../config/constants';
+import { SPACING, FONTS, FONT_WEIGHTS } from '../config/constants';
 import { TEXT_STYLES } from '../config/typography';
 import { useTheme } from '../context/ThemeContext';
 import { TripAlbum } from '../models/TripAlbum';
 import BackArrow from '../components/common/icons/BackArrow';
 import { MeshGradientBackground } from '../components/common/MeshGradientBackground';
 import TripAlbumSegmentControl from '../components/review/TripAlbumSegmentControl';
-import AllSection from '../components/review/AllSection';
+import BookmarksSection from '../components/review/BookmarksSection';
 import MapViewSection from '../components/review/MapViewSection';
 import DashboardSection from '../components/review/DashboardSection';
+import { isTripFinished } from '../utils/albumUtils';
 import { Ionicons } from '@expo/vector-icons';
 
 type TripAlbumDetailScreenNavigationProp = NativeStackNavigationProp<RootStackParamList, 'TripAlbumDetail'>;
@@ -33,7 +34,6 @@ const TripAlbumDetailScreen: React.FC = () => {
   const { tripAlbums, entries, journals, deleteTripAlbum } = useAppContext();
 
   const [activeSection, setActiveSection] = useState<'all' | 'dashboard' | 'map'>('all');
-  const [showGalleryBookmarksOnly, setShowGalleryBookmarksOnly] = useState(false);
   const [menuVisible, setMenuVisible] = useState(false);
   const [menuExiting, setMenuExiting] = useState(false);
   const menuOverlayOpacity = useRef(new Animated.Value(0)).current;
@@ -59,6 +59,9 @@ const TripAlbumDetailScreen: React.FC = () => {
   const album = useMemo(() => {
     return tripAlbums.find(a => a.id === albumId);
   }, [tripAlbums, albumId]);
+
+  // Recap summarizes a finished trip — not offered until the trip is over.
+  const tripFinished = useMemo(() => (album ? isTripFinished(album) : false), [album]);
 
   // Filter entries and journals for this album
   const albumEntries = useMemo(() => {
@@ -142,22 +145,6 @@ const TripAlbumDetailScreen: React.FC = () => {
         emptyStateText: { ...TEXT_STYLES.entryInput, fontSize: 18, marginBottom: SPACING.sm, color: colors.textPrimary },
         emptyStateSubtext: { ...TEXT_STYLES.placeholderText, textAlign: 'center', color: colors.textSecondary },
         sectionPanel: { flex: 1 },
-        galleryFilterRow: {
-          flexDirection: 'row',
-          paddingHorizontal: SPACING.md,
-          paddingVertical: SPACING.xs,
-          gap: SPACING.sm,
-        },
-        galleryFilterButton: {
-          paddingHorizontal: SPACING.md,
-          paddingVertical: SPACING.sm,
-          borderRadius: 20,
-        },
-        galleryFilterButtonText: {
-          ...TEXT_STYLES.entryInput,
-          fontSize: 14,
-          fontWeight: FONT_WEIGHTS.semibold,
-        },
       }),
     [colors]
   );
@@ -392,6 +379,7 @@ const TripAlbumDetailScreen: React.FC = () => {
           onSegmentChange={setActiveSection}
           onActiveSegmentPress={scrollActiveSectionToTop}
           onRecapPress={handleRecapPress}
+          showRecap={tripFinished}
         />
       </View>
 
@@ -410,35 +398,13 @@ const TripAlbumDetailScreen: React.FC = () => {
           accessibilityElementsHidden={activeSection !== 'all'}
           importantForAccessibility={activeSection === 'all' ? 'auto' : 'no-hide-descendants'}
         >
-          <>
-            <View style={styles.galleryFilterRow}>
-              <TouchableOpacity
-                style={[styles.galleryFilterButton, { backgroundColor: colors.surface }, showGalleryBookmarksOnly && { opacity: 0.7 }]}
-                onPress={() => setShowGalleryBookmarksOnly(false)}
-                accessibilityRole="button"
-                accessibilityLabel="Show all"
-                accessibilityState={{ selected: !showGalleryBookmarksOnly }}
-              >
-                <Text style={[styles.galleryFilterButtonText, { color: colors.textPrimary }]}>All</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.galleryFilterButton, { backgroundColor: colors.surface }, !showGalleryBookmarksOnly && { opacity: 0.7 }]}
-                onPress={() => setShowGalleryBookmarksOnly(true)}
-                accessibilityRole="button"
-                accessibilityLabel="Show bookmarks only"
-                accessibilityState={{ selected: showGalleryBookmarksOnly }}
-              >
-                <Text style={[styles.galleryFilterButtonText, { color: colors.textPrimary }]}>Bookmarks</Text>
-              </TouchableOpacity>
-            </View>
-            <AllSection
-              entries={showGalleryBookmarksOnly ? albumEntries.filter(e => e.isAwe === true) : albumEntries}
-              journals={showGalleryBookmarksOnly ? [] : albumJournals}
-              onEntryPress={handleEntryPress}
-              onJournalPress={handleJournalPress}
-              scrollRef={allScrollRef}
-            />
-          </>
+          <BookmarksSection
+            entries={albumEntries}
+            journals={albumJournals}
+            onEntryPress={handleEntryPress}
+            onJournalPress={handleJournalPress}
+            scrollRef={allScrollRef}
+          />
         </View>
         <View
           style={[styles.sectionPanel, { display: activeSection === 'dashboard' ? 'flex' : 'none' }]}
@@ -450,6 +416,7 @@ const TripAlbumDetailScreen: React.FC = () => {
             journals={albumJournals}
             tripAlbums={[album]}
             tripFilterActive
+            isVisible={activeSection === 'dashboard'}
             scrollRef={dashboardScrollRef}
           />
         </View>

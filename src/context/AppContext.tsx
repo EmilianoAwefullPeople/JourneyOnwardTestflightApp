@@ -8,9 +8,8 @@ import { Entry } from '../models/Entry';
 import { Journal } from '../models/Journal';
 import { TripAlbum } from '../models/TripAlbum';
 import { Postcard } from '../models/Postcard';
-import { UserProfile } from '../models/UserProfile';
 import * as PersistenceManager from '../storage/PersistenceManager';
-import { resolveMediaPath } from '../storage/mediaStorage';
+import { resolveMediaPath, deletePostcardPhotoThumbnails } from '../storage/mediaStorage';
 import { TRAVEL_MODE_KEYS, loadTravelModeState, saveTravelModeState } from '../storage/PersistenceManager';
 import { logger } from '../utils/logger';
 import { useMetadataBackfillWhenOnline } from '../hooks/useMetadataBackfillWhenOnline';
@@ -18,9 +17,10 @@ import { useCountryBackfillWhenOnline } from '../hooks/useCountryBackfillWhenOnl
 import { useJournalLocationBackfillWhenOnline } from '../hooks/useJournalLocationBackfillWhenOnline';
 import { useColorPaletteBackfill } from '../hooks/useColorPaletteBackfill';
 import { useThumbnailBackfill } from '../hooks/useThumbnailBackfill';
+import { usePhotoDimensionsBackfill } from '../hooks/usePhotoDimensionsBackfill';
 import { useEntryMediaRepair, ENTRY_MEDIA_REPAIR_STORAGE_KEY } from '../hooks/useEntryMediaRepair';
 import { persistLog } from '../utils/persistentLogger';
-import { generateUUID } from '../utils/uuid';
+import { Analytics } from '../services/AnalyticsService';
 import { IMPORT_LATEST_IMPORTED_IDS_KEY } from '../utils/importLatestStorage';
 import { STATS_TIME_SCOPE_KEY } from '../utils/statsScopeStorage';
 import { clearAllCachedPalettes } from '../storage/dashboardPaletteCache';
@@ -29,19 +29,7 @@ interface AppContextType {
   // User state
   userName: string | null;
   isLoading: boolean;
-  isFirstLaunch: boolean;
   setUserName: (name: string) => Promise<void>;
-
-  // Onboarding state
-  onboardingCompleted: boolean;
-  userProfile: UserProfile | null;
-  onboardingResumePath: 'quick_start' | 'tutorial' | null;
-  onboardingResumeStep: number;
-  saveUserProfile: (updates: Partial<UserProfile>) => Promise<void>;
-  completeOnboarding: (path: 'quick_start' | 'tutorial') => Promise<void>;
-  resetOnboarding: () => Promise<void>;
-  setOnboardingResumeStep: (path: 'quick_start' | 'tutorial', step: number) => Promise<void>;
-  recordTutorialTry: (field: 'triedTravelMode' | 'triedJournalEntry' | 'triedGallerySync' | 'triedTripAlbum' | 'triedJourneyRecap' | 'triedPostcards') => Promise<void>;
 
   // Data state
   entries: Entry[];
@@ -65,7 +53,7 @@ interface AppContextType {
   updateJournal: (journal: Journal) => Promise<void>;
   deleteJournal: (id: string) => Promise<void>;
   
-  createTripAlbum: (album: TripAlbum) => Promise<void>;
+  createTripAlbum: (album: TripAlbum, creationMethod?: 'unpack' | 'import' | 'new') => Promise<void>;
   updateTripAlbum: (album: TripAlbum) => Promise<void>;
   deleteTripAlbum: (id: string) => Promise<void>;
 
@@ -76,7 +64,7 @@ interface AppContextType {
   // Initialization
   initializeApp: () => Promise<void>;
   refreshData: () => Promise<void>;
-  /** Clears all data and resets to first-launch state; call then navigate to Welcome. */
+  /** Clears all data and resets state. */
   resetApp: () => Promise<void>;
 
   // Emotion capture return value (set by EmotionCaptureScreen on Save/Skip; read by Capture/EntryEdit on focus)
@@ -88,16 +76,20 @@ interface AppContextType {
   // Home screen preferences
   showHomeMap: boolean;
   setShowHomeMap: (val: boolean) => Promise<void>;
+
+  // Onboarding
+  hasCompletedOnboarding: boolean;
+  completeOnboarding: (path: 'unpack' | 'trip_album' | 'explore') => Promise<void>;
+  pendingOnboardingPath: 'unpack' | 'trip_album' | null;
+  setPendingOnboardingPath: (path: 'unpack' | 'trip_album' | null) => void;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
 const STORAGE_KEYS = {
   USER_NAME: '@awefull_people:user_name',
-  FIRST_LAUNCH: '@awefull_people:first_launch',
   SHOW_HOME_MAP: '@awefull_people:show_home_map',
   ONBOARDING_COMPLETED: '@awefull_people:onboarding_completed',
-  ONBOARDING_RESUME: '@awefull_people:onboarding_resume',
 };
 
 interface AppProviderProps {
@@ -110,8 +102,7 @@ let _photoAuditRanThisSession = false;
 export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   const [userName, setUserNameState] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [isFirstLaunch, setIsFirstLaunch] = useState(true);
-  
+
   // Data state
   const [entries, setEntries] = useState<Entry[]>([]);
   const [journals, setJournals] = useState<Journal[]>([]);
@@ -124,11 +115,9 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   // Home screen preferences
   const [showHomeMap, setShowHomeMapState] = useState(false);
 
-  // Onboarding state
-  const [onboardingCompleted, setOnboardingCompletedState] = useState(false);
-  const [userProfile, setUserProfileState] = useState<UserProfile | null>(null);
-  const [onboardingResumePath, setOnboardingResumePathState] = useState<'quick_start' | 'tutorial' | null>(null);
-  const [onboardingResumeStep, setOnboardingResumeStepState] = useState(0);
+  // Onboarding
+  const [hasCompletedOnboarding, setHasCompletedOnboarding] = useState(false);
+  const [pendingOnboardingPath, setPendingOnboardingPath] = useState<'unpack' | 'trip_album' | null>(null);
 
   // Travel Mode state
   const [travelModeEnabled, setTravelModeEnabled] = useState(false);
@@ -147,36 +136,22 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
 
   const loadUserData = async () => {
     try {
-      const [name, firstLaunch, tmEnabled, tmExplicitlyDisabled, showMap, onboardingDone, onboardingResume] = await Promise.all([
+      const [name, tmEnabled, tmExplicitlyDisabled, showMap, onboardingDone] = await Promise.all([
         AsyncStorage.getItem(STORAGE_KEYS.USER_NAME),
-        AsyncStorage.getItem(STORAGE_KEYS.FIRST_LAUNCH),
         AsyncStorage.getItem(TRAVEL_MODE_KEYS.ENABLED),
         AsyncStorage.getItem(TRAVEL_MODE_KEYS.EXPLICITLY_DISABLED),
         AsyncStorage.getItem(STORAGE_KEYS.SHOW_HOME_MAP),
         AsyncStorage.getItem(STORAGE_KEYS.ONBOARDING_COMPLETED),
-        AsyncStorage.getItem(STORAGE_KEYS.ONBOARDING_RESUME),
       ]);
 
       if (name) setUserNameState(name);
-      if (firstLaunch === 'false') setIsFirstLaunch(false);
+      if (onboardingDone === 'true') setHasCompletedOnboarding(true);
 
       // Pre-populate travel mode from cache so UI doesn't flicker on slow DB loads
       if (tmEnabled !== null) setTravelModeEnabled(tmEnabled === 'true');
       if (tmExplicitlyDisabled !== null) setTravelModeExplicitlyDisabled(tmExplicitlyDisabled === 'true');
       // null means never set → keep initial default (map hidden)
       if (showMap !== null) setShowHomeMapState(showMap === 'true');
-
-      if (onboardingDone === 'true') setOnboardingCompletedState(true);
-
-      if (onboardingResume) {
-        try {
-          const parsed = JSON.parse(onboardingResume) as { path: 'quick_start' | 'tutorial'; step: number };
-          setOnboardingResumePathState(parsed.path ?? null);
-          setOnboardingResumeStepState(parsed.step ?? 0);
-        } catch {
-          // Ignore malformed resume data
-        }
-      }
     } catch (error) {
       logger.error('Error loading user data:', error);
       // Don't throw - allow app to continue even if user data fails to load
@@ -283,10 +258,9 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         PersistenceManager.getActiveTripAlbum().catch(() => null),
         PersistenceManager.getActiveTripAlbums().catch(() => []),
         PersistenceManager.getPostcards().catch(() => []),
-        PersistenceManager.getUserProfile().catch(() => null),
-      ])) as [Entry[], Journal[], TripAlbum[], TripAlbum | null, TripAlbum[], Postcard[], import('../models/UserProfile').UserProfile | null];
+      ])) as [Entry[], Journal[], TripAlbum[], TripAlbum | null, TripAlbum[], Postcard[]];
 
-      const [loadedEntries, loadedJournals, loadedAlbums, activeTrip, activeAlbums, loadedPostcards, loadedProfile] = result;
+      const [loadedEntries, loadedJournals, loadedAlbums, activeTrip, activeAlbums, loadedPostcards] = result;
 
       // Only set state when data actually changed — prevents cascading re-renders
       // on no-op refreshes (foreground returns, backfills that touched nothing visible).
@@ -307,7 +281,27 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       }
       setPostcards(loadedPostcards || []);
       setActiveTripAlbum(activeTrip || null);
-      if (loadedProfile) setUserProfileState(loadedProfile);
+
+      // Push latest country + full countries list from SQLite entries every session.
+      const entriesWithCountry = (loadedEntries || []).filter(e => e.country);
+      const latestCountry = entriesWithCountry
+        .slice()
+        .sort((a, b) => (b.timestamp ?? '').localeCompare(a.timestamp ?? ''))
+        [0]?.country ?? null;
+      const allCountries = [...new Set(entriesWithCountry.map(e => e.country as string))];
+      Analytics.syncCountriesFromEntries(latestCountry, allCountries).catch(() => {});
+
+      // One-time backfill of pre-analytics SQLite counts. No-ops after first run.
+      const t = getTodayString();
+      Analytics.syncInitialData({
+        totalAlbumCount:       (loadedAlbums  || []).length,
+        pastAlbumCount:        (loadedAlbums  || []).filter(a => !!(a.endDate && a.endDate < t)).length,
+        liveAlbumCount:        (loadedAlbums  || []).filter(a => !(a.endDate && a.endDate < t)).length,
+        currentLiveAlbumCount: (activeAlbums  || []).length,
+        imageCount:            (loadedEntries || []).reduce((s, e) => s + (e.photoPaths?.length ?? 0), 0),
+        momentCount:           (loadedEntries || []).length,
+        noteCount:             (loadedJournals|| []).length,
+      }).catch(() => {});
 
       // Fire-and-forget photo path audit — deferred until after first frame so it
       // never competes with initial render. Runs once per JS session only.
@@ -339,10 +333,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     try {
       await AsyncStorage.setItem(STORAGE_KEYS.USER_NAME, name);
       setUserNameState(name);
-      
-      // Mark first launch as complete
-      await AsyncStorage.setItem(STORAGE_KEYS.FIRST_LAUNCH, 'false');
-      setIsFirstLaunch(false);
+      Analytics.setUserName(name).catch(() => {});
     } catch (error) {
       logger.error('Error saving user name:', error);
       throw error;
@@ -386,6 +377,12 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       return [resolved, ...prev.filter(x => x.id !== entry.id)];
     });
     scheduleRefresh();
+    const isLiveCapture = !!(entry.albumId && activeTripAlbums.some(a => a.id === entry.albumId));
+    const liveAlbumCaptureCount = isLiveCapture
+      ? entries.filter(e => e.albumId === entry.albumId).length + 1
+      : 0;
+    Analytics.onEntryCreated({ ...entry, isLiveCapture, liveAlbumCaptureCount }).catch(() => {});
+    if (entry.country) Analytics.setLastKnownCountry(entry.country).catch(() => {});
   };
 
   const updateEntry = async (entry: Entry) => {
@@ -405,6 +402,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   useCountryBackfillWhenOnline(scheduleRefresh);
   useColorPaletteBackfill(scheduleRefresh);
   useThumbnailBackfill(scheduleRefresh);
+  usePhotoDimensionsBackfill(scheduleRefresh);
 
   // Refresh data when the app returns to the foreground (e.g. after phone lock or switching apps).
   // Skips the first 'active' event on mount since initializeApp handles the initial load.
@@ -414,6 +412,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       if (nextState === 'active') {
         if (appStateRef.skipFirst) { appStateRef.skipFirst = false; return; }
         scheduleRefresh();
+        Analytics.onSessionStart().catch(() => {});
       }
     });
     return () => subscription.remove();
@@ -424,6 +423,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     await PersistenceManager.createJournal(journal);
     setJournals(prev => [journal, ...prev.filter(j => j.id !== journal.id)]);
     scheduleRefresh();
+    Analytics.onNoteCreated().catch(() => {});
   };
 
   const updateJournal = async (journal: Journal) => {
@@ -441,7 +441,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   useJournalLocationBackfillWhenOnline(updateJournal);
 
   // Trip Album operations
-  const createTripAlbum = async (album: TripAlbum) => {
+  const createTripAlbum = async (album: TripAlbum, creationMethod: 'unpack' | 'import' | 'new' = 'new') => {
     await PersistenceManager.createTripAlbum(album);
     try {
       await PersistenceManager.assignExistingItemsToAlbum(album);
@@ -450,6 +450,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       // Album was created; continue so UI updates. Items can be added manually if needed.
     }
     scheduleRefresh();
+    Analytics.onAlbumCreated(album, creationMethod).catch(() => {});
   };
 
   const updateTripAlbum = async (album: TripAlbum) => {
@@ -459,15 +460,18 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   };
 
   const deleteTripAlbum = async (id: string) => {
+    const album = tripAlbums.find(a => a.id === id);
     await PersistenceManager.deleteTripAlbum(id);
     setTripAlbums(prev => prev.filter(a => a.id !== id));
     scheduleRefresh();
+    if (album) Analytics.onAlbumDeleted(album).catch(() => {});
   };
 
   // Postcard operations
   const createPostcard = async (postcard: Postcard) => {
     await PersistenceManager.createPostcard(postcard);
     scheduleRefresh();
+    Analytics.onPostcardCreated().catch(() => {});
   };
 
   const updatePostcard = async (postcard: Postcard) => {
@@ -477,6 +481,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
 
   const deletePostcard = async (id: string) => {
     await PersistenceManager.deletePostcard(id);
+    deletePostcardPhotoThumbnails(id);
     scheduleRefresh();
   };
 
@@ -495,6 +500,10 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       loadData().catch(error => {
         logger.error('Background data load error:', error);
       });
+
+      // Analytics: register/update device row in jo_users. Fire-and-forget.
+      Analytics.initialize().catch(() => {});
+
     } catch (error) {
       logger.error('Error during app initialization:', error);
       // Always set loading to false, even if there were errors
@@ -507,104 +516,20 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     await AsyncStorage.setItem(STORAGE_KEYS.SHOW_HOME_MAP, String(val));
   };
 
-  // ---------------------------------------------------------------------------
-  // Onboarding helpers
-  // ---------------------------------------------------------------------------
-
-  const saveUserProfile = async (updates: Partial<UserProfile>) => {
-    try {
-      const now = new Date().toISOString();
-      const existing = userProfile;
-      const merged: UserProfile = {
-        id: existing?.id ?? generateUUID(),
-        name: updates.name ?? existing?.name ?? '',
-        travelerTier: updates.travelerTier ?? existing?.travelerTier,
-        intent: updates.intent ?? existing?.intent ?? [],
-        email: updates.email ?? existing?.email,
-        phone: updates.phone ?? existing?.phone,
-        onboardingCompletedAt: updates.onboardingCompletedAt ?? existing?.onboardingCompletedAt,
-        onboardingPathTaken: updates.onboardingPathTaken ?? existing?.onboardingPathTaken,
-        triedTravelMode: updates.triedTravelMode ?? existing?.triedTravelMode ?? false,
-        triedJournalEntry: updates.triedJournalEntry ?? existing?.triedJournalEntry ?? false,
-        triedGallerySync: updates.triedGallerySync ?? existing?.triedGallerySync ?? false,
-        triedTripAlbum: updates.triedTripAlbum ?? existing?.triedTripAlbum ?? false,
-        triedJourneyRecap: updates.triedJourneyRecap ?? existing?.triedJourneyRecap ?? false,
-        triedPostcards: updates.triedPostcards ?? existing?.triedPostcards ?? false,
-        createdAt: existing?.createdAt ?? now,
-        updatedAt: now,
-      };
-      await PersistenceManager.upsertUserProfile(merged);
-      setUserProfileState(merged);
-    } catch (error) {
-      logger.error('Error saving user profile:', error);
-      throw error;
-    }
-  };
-
-  const completeOnboarding = async (path: 'quick_start' | 'tutorial') => {
-    try {
-      const now = new Date().toISOString();
-      // Save name to legacy user_name key so the rest of the app can access it
-      if (userProfile?.name) {
-        await AsyncStorage.setItem(STORAGE_KEYS.USER_NAME, userProfile.name);
-        setUserNameState(userProfile.name);
-      }
-      await AsyncStorage.setItem(STORAGE_KEYS.FIRST_LAUNCH, 'false');
-      setIsFirstLaunch(false);
-      await AsyncStorage.setItem(STORAGE_KEYS.ONBOARDING_COMPLETED, 'true');
-      setOnboardingCompletedState(true);
-      await AsyncStorage.removeItem(STORAGE_KEYS.ONBOARDING_RESUME);
-      setOnboardingResumePathState(null);
-      setOnboardingResumeStepState(0);
-      // Update profile with completion metadata
-      await saveUserProfile({ onboardingCompletedAt: now, onboardingPathTaken: path });
-    } catch (error) {
-      logger.error('Error completing onboarding:', error);
-      throw error;
-    }
-  };
-
-  const resetOnboarding = async () => {
-    try {
-      // Reset flags so the user sees onboarding again, but keep their data and profile
-      await AsyncStorage.setItem(STORAGE_KEYS.FIRST_LAUNCH, 'true');
-      setIsFirstLaunch(true);
-      await AsyncStorage.removeItem(STORAGE_KEYS.ONBOARDING_COMPLETED);
-      setOnboardingCompletedState(false);
-      await AsyncStorage.removeItem(STORAGE_KEYS.ONBOARDING_RESUME);
-      setOnboardingResumePathState(null);
-      setOnboardingResumeStepState(0);
-    } catch (error) {
-      logger.error('Error resetting onboarding:', error);
-      throw error;
-    }
-  };
-
-  const setOnboardingResumeStep = async (path: 'quick_start' | 'tutorial', step: number) => {
-    try {
-      const payload = JSON.stringify({ path, step });
-      await AsyncStorage.setItem(STORAGE_KEYS.ONBOARDING_RESUME, payload);
-      setOnboardingResumePathState(path);
-      setOnboardingResumeStepState(step);
-    } catch (error) {
-      logger.error('Error saving onboarding resume step:', error);
-    }
-  };
-
-  const recordTutorialTry = async (
-    field: 'triedTravelMode' | 'triedJournalEntry' | 'triedGallerySync' | 'triedTripAlbum' | 'triedJourneyRecap' | 'triedPostcards'
-  ) => {
-    if (userProfile?.[field]) return; // already recorded
-    await saveUserProfile({ [field]: true });
+  const completeOnboarding = async (path: 'unpack' | 'trip_album' | 'explore') => {
+    setHasCompletedOnboarding(true);
+    setPendingOnboardingPath(null);
+    await AsyncStorage.setItem(STORAGE_KEYS.ONBOARDING_COMPLETED, 'true');
+    PersistenceManager.upsertOnboardingCompletion(path).catch(e => {
+      logger.error('Error writing onboarding completion to DB:', e);
+    });
+    Analytics.track('onboarding_completed', { path }).catch(() => {});
   };
 
   const resetApp = async () => {
     try {
       await Promise.all([
         AsyncStorage.removeItem(STORAGE_KEYS.USER_NAME),
-        AsyncStorage.removeItem(STORAGE_KEYS.FIRST_LAUNCH),
-        AsyncStorage.removeItem(STORAGE_KEYS.ONBOARDING_COMPLETED),
-        AsyncStorage.removeItem(STORAGE_KEYS.ONBOARDING_RESUME),
         AsyncStorage.removeItem(IMPORT_LATEST_IMPORTED_IDS_KEY),
         AsyncStorage.removeItem(TRAVEL_MODE_KEYS.ENABLED),
         AsyncStorage.removeItem(TRAVEL_MODE_KEYS.EXPLICITLY_DISABLED),
@@ -614,11 +539,11 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         AsyncStorage.removeItem(ENTRY_MEDIA_REPAIR_STORAGE_KEY),
         AsyncStorage.removeItem(STATS_TIME_SCOPE_KEY),
         AsyncStorage.removeItem(STORAGE_KEYS.SHOW_HOME_MAP),
+        AsyncStorage.removeItem(STORAGE_KEYS.ONBOARDING_COMPLETED),
       ]);
       await PersistenceManager.clearAllData();
       await clearAllCachedPalettes();
       setUserNameState(null);
-      setIsFirstLaunch(true);
       setEntries([]);
       setJournals([]);
       setTripAlbums([]);
@@ -628,10 +553,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       setTravelModeExplicitlyDisabled(false);
       setActiveTripAlbums([]);
       setShowHomeMapState(false);
-      setOnboardingCompletedState(false);
-      setUserProfileState(null);
-      setOnboardingResumePathState(null);
-      setOnboardingResumeStepState(0);
+      setHasCompletedOnboarding(false);
       _photoAuditRanThisSession = false;
     } catch (error) {
       logger.error('Error during resetApp:', error);
@@ -646,17 +568,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   const value: AppContextType = {
     userName,
     isLoading,
-    isFirstLaunch,
     setUserName,
-    onboardingCompleted,
-    userProfile,
-    onboardingResumePath,
-    onboardingResumeStep,
-    saveUserProfile,
-    completeOnboarding,
-    resetOnboarding,
-    setOnboardingResumeStep,
-    recordTutorialTry,
     entries,
     journals,
     tripAlbums,
@@ -687,6 +599,10 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     setPendingEmotionNote,
     showHomeMap,
     setShowHomeMap,
+    hasCompletedOnboarding,
+    completeOnboarding,
+    pendingOnboardingPath,
+    setPendingOnboardingPath,
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

@@ -28,6 +28,8 @@ interface TripAlbumSegmentControlProps {
   onSegmentChange: (segment: TripAlbumSection) => void;
   onActiveSegmentPress?: (segment: TripAlbumSection) => void;
   onRecapPress?: () => void;
+  /** Recap summarizes a finished trip — the button is hidden until the trip is over. */
+  showRecap?: boolean;
 }
 
 const ICON_SIZE = 22;
@@ -104,7 +106,7 @@ function AnimatedSegmentLabel({ children, style, isExiting = false, onExitComple
   );
 }
 
-function TripAlbumSegmentControl({ activeSegment, onSegmentChange, onActiveSegmentPress, onRecapPress }: TripAlbumSegmentControlProps) {
+function TripAlbumSegmentControl({ activeSegment, onSegmentChange, onActiveSegmentPress, onRecapPress, showRecap = true }: TripAlbumSegmentControlProps) {
   const { colors, isDark } = useTheme();
   const reduceMotion = useReduceMotion();
   const [exitingSegment, setExitingSegment] = useState<TripAlbumSection | null>(null);
@@ -252,18 +254,20 @@ function TripAlbumSegmentControl({ activeSegment, onSegmentChange, onActiveSegme
           </View>
         </TouchableOpacity>
 
-        <TouchableOpacity
-          style={[styles.segmentButton, styles.segmentButtonInactive]}
-          onPress={onRecapPress}
-          activeOpacity={0.7}
-          accessibilityRole="button"
-          accessibilityLabel="Play recap"
-          disabled={exitingSegment != null}
-        >
-          <View style={styles.segmentContent}>
-            <Ionicons name="play-circle-outline" size={ICON_SIZE} color={colors.textSecondary} />
-          </View>
-        </TouchableOpacity>
+        {showRecap && (
+          <TouchableOpacity
+            style={[styles.segmentButton, styles.segmentButtonInactive]}
+            onPress={onRecapPress}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="Play recap"
+            disabled={exitingSegment != null}
+          >
+            <View style={styles.segmentContent}>
+              <Ionicons name="play-circle-outline" size={ICON_SIZE} color={colors.textSecondary} />
+            </View>
+          </TouchableOpacity>
+        )}
 
       </View>
     </View>

@@ -9,6 +9,7 @@ import { RootStackParamList } from '../../navigation/types';
 import { FONTS, FONT_WEIGHTS, SPACING } from '../../config/constants';
 import { TripAlbum } from '../../models/TripAlbum';
 import { Entry } from '../../models/Entry';
+import { isTripFinished } from '../../utils/albumUtils';
 
 type Nav = NativeStackNavigationProp<RootStackParamList>;
 
@@ -20,7 +21,6 @@ function getFirstImageUri(entry: Entry): string {
   return (
     (entry.photoPaths && entry.photoPaths[0]) ||
     (entry.mediaPaths && entry.mediaPaths[0]) ||
-    (entry.storageUrls && entry.storageUrls[0]) ||
     ''
   );
 }
@@ -42,6 +42,7 @@ const StudioJourneyRecapRow: React.FC = () => {
 
     const cards: AlbumCard[] = [];
     for (const album of sorted) {
+      if (!isTripFinished(album)) continue;
       const photoEntry = entries.find(
         (e) => e.albumId === album.id && !!getFirstImageUri(e)
       );

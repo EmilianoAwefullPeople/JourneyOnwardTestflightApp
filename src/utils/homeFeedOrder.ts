@@ -133,6 +133,21 @@ function avoidRepeatTop(items: HomeFeedItem[], avoid: HomeFeedTopRef, rng: () =>
 }
 
 /**
+ * Newest-first chronological order (timestamp descending, stable id tie-break).
+ */
+export function buildChronologicalFeedItems(items: HomeFeedItem[]): HomeFeedItem[] {
+  if (items.length === 0) return [];
+  return [...items].sort((a, b) => {
+    const ta = new Date(a.data.timestamp).getTime();
+    const tb = new Date(b.data.timestamp).getTime();
+    const na = Number.isFinite(ta) ? ta : 0;
+    const nb = Number.isFinite(tb) ? tb : 0;
+    if (nb !== na) return nb - na;
+    return a.data.id < b.data.id ? -1 : a.data.id > b.data.id ? 1 : 0;
+  });
+}
+
+/**
  * Builds a deterministic feed order from a seed string, with journal spacing and
  * optional "not same as last top". Passing the same seed + same items always
  * produces the same order, so AppContext refreshes (e.g. metadata backfill) don't
@@ -159,6 +174,38 @@ export function buildOrderedFeedItems(items: HomeFeedItem[], avoidFirst: HomeFee
   }
 
   return avoidRepeatTop(ordered, avoidFirst, rng);
+}
+
+/**
+ * Splices EVERY extra item (e.g. all trip Recap/Stories cards) into an already-ordered feed,
+ * in a randomized order, evenly spread across it — never at index 0 (the top card stays a real
+ * memory). All extras are always included, however many there are; when there are more extras
+ * than base items they end up densely (but still evenly, not clustered at the end) interleaved.
+ * Deterministic per seed like the rest of this module, so positions only change when `seed`
+ * changes (pull-to-refresh), not on every re-render.
+ */
+export function insertSpacedRandomItems<T, E>(
+  items: T[],
+  extras: E[],
+  seed: string
+): Array<T | E> {
+  if (items.length === 0 || extras.length === 0) return [...items];
+
+  const rng = makeRng(seed);
+  const picked = shuffleInPlace([...extras], rng);
+
+  const n = items.length;
+  const m = picked.length;
+  const result: Array<T | E> = [...items];
+  // Target position for the i-th extra is proportional along the ORIGINAL item list (not the
+  // growing result array), so extras stay evenly spread even when m > n instead of overflowing
+  // to the tail once the fixed-spacing math runs out of room.
+  picked.forEach((extra, i) => {
+    const targetBaseIndex = Math.min(n, Math.max(1, Math.round(((i + 1) * n) / (m + 1))));
+    const insertAt = Math.min(result.length, targetBaseIndex + i);
+    result.splice(insertAt, 0, extra);
+  });
+  return result;
 }
 
 /** Deterministic safe merge if random merge ever violates constraints. */

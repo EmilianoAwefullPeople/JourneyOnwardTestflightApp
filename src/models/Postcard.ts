@@ -16,19 +16,19 @@ export interface Postcard {
   updatedAt: string;
   templateId: string;
   aspectRatio: '1:1' | '4:5' | '9:16';
-  topPhotoPath: string | null;
-  bottomPhotoPath: string | null;
-  topLabel: string;
-  bottomLabel: string;
+  photo1Path: string | null;
+  photo2Path: string | null;
+  label1: string;
+  label2: string;
   downloaded: boolean;
-  /** Pinch/pan framing for the top slot; omit or null for default. */
-  topPhotoTransform?: PostcardPhotoTransform | null;
-  /** Pinch/pan framing for the bottom slot; omit or null for default. */
-  bottomPhotoTransform?: PostcardPhotoTransform | null;
+  /** Pinch/pan framing for slot 1; omit or null for default. */
+  photo1Transform?: PostcardPhotoTransform | null;
+  /** Pinch/pan framing for slot 2; omit or null for default. */
+  photo2Transform?: PostcardPhotoTransform | null;
   photo3Path?: string | null;
   photo3Transform?: PostcardPhotoTransform | null;
   photo4Path?: string | null;
   photo4Transform?: PostcardPhotoTransform | null;
-  /** Template-specific data (badge type for T-12, slot entry IDs, etc.) stored as JSON. */
+  /** Template-specific data (slot entry IDs, etc.) stored as JSON. */
   templateData?: Record<string, unknown> | null;
 }

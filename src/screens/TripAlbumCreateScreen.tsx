@@ -40,7 +40,7 @@ const TripAlbumCreateScreen: React.FC = () => {
   const route = useRoute<TripAlbumScreenRouteProp>();
   const insets = useSafeAreaInsets();
   const { colors, isDark } = useTheme();
-  const { createTripAlbum, updateTripAlbum, tripAlbums } = useAppContext();
+  const { createTripAlbum, updateTripAlbum, tripAlbums, pendingOnboardingPath, completeOnboarding } = useAppContext();
 
   const albumId = (route.params as { albumId?: string } | undefined)?.albumId;
   const isEditMode = Boolean(albumId);
@@ -147,7 +147,10 @@ const TripAlbumCreateScreen: React.FC = () => {
         await updateTripAlbum(album);
         navigation.goBack();
       } else {
-        await createTripAlbum(album);
+        await createTripAlbum(album, 'new');
+        if (pendingOnboardingPath === 'trip_album') {
+          await completeOnboarding('trip_album');
+        }
         navigation.dispatch(
           CommonActions.reset({
             index: 0,

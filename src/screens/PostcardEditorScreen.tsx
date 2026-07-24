@@ -9,8 +9,8 @@ import {
   TextInput,
   Alert,
   ActivityIndicator,
-  ScrollView,
 } from 'react-native';
+import DateTimePicker from '@react-native-community/datetimepicker';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
@@ -29,7 +29,39 @@ import { RootStackParamList } from '../navigation/types';
 import { FONTS, FONT_WEIGHTS, SPACING } from '../config/constants';
 import { generateUUID } from '../utils/uuid';
 import { logger } from '../utils/logger';
-import { getTemplateById } from '../config/templateRegistry';
+import { Analytics } from '../services/AnalyticsService';
+import {
+  normalizeTemplateId,
+  getMaxSlotsForTemplate,
+  loadTemplateComponent,
+  buildSlotsFromPostcard,
+  packPostcardPhotoFields,
+} from '../components/postcards/templates/templateLoader';
+import {
+  parseSelectedRange,
+  buildRangeTemplateData,
+  formatDateRangeLabel,
+  clampEndToRange,
+  parseDateOnlyIso,
+  addDays,
+  RANGE_MIN_DAYS,
+  RANGE_MAX_DAYS,
+} from '../components/postcards/templates/monthCalendarUtils';
+import {
+  TRIPTYCH_DATA_CATEGORIES,
+  parseDataCategory,
+  type TriptychDataCategory,
+} from '../components/postcards/templates/triptychStampsUtils';
+import {
+  LOCATION_TAG_MODES,
+  LOCATION_GRANULARITIES,
+  resolveTagMode,
+  parseLocationGranularity,
+  type LocationTagMode,
+  type LocationGranularity,
+} from '../components/postcards/templates/locationTagUtils';
+import { deriveDiptychLabels } from '../components/postcards/templates/diptychCaptionUtils';
+
 import type { TemplateSlot } from '../components/postcards/templates/sharedTypes';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'PostcardEditor'>;
@@ -41,8 +73,6 @@ const RATIO_OPTIONS: { label: RatioKey; value: number }[] = [
   { label: '4:5', value: 4 / 5 },
   { label: '9:16', value: 9 / 16 },
 ];
-
-const BADGE_TYPE_OPTIONS = ['temperature', 'altitude', 'weather', 'date', 'place'];
 
 /** forwardRef/memo exports are objects with $$typeof, not `typeof === 'function'`. */
 function isRenderableComponentType(c: unknown): c is React.ComponentType<any> {
@@ -90,15 +120,145 @@ const TextEditOverlay: React.FC<TextEditOverlayProps> = ({ value, onChange, onDo
             submitBehavior="blurAndSubmit"
             multiline={false}
             maxLength={60}
-            selectionColor="#F5C842"
-            placeholderTextColor="rgba(245, 200, 66, 0.35)"
-            placeholder="Type something..."
+            selectionColor="#FFE600"
+            placeholderTextColor="rgba(255, 230, 0, 0.4)"
+            placeholder="type something..."
           />
         </View>
       </KeyboardAvoidingView>
     </View>
   );
 };
+
+interface DateRangeSheetProps {
+  visible: boolean;
+  start: Date;
+  end: Date;
+  onChangeStart: (date: Date) => void;
+  onChangeEnd: (date: Date) => void;
+  onDone: () => void;
+  onCancel: () => void;
+}
+
+const DateRangeSheet: React.FC<DateRangeSheetProps> = ({
+  visible,
+  start,
+  end,
+  onChangeStart,
+  onChangeEnd,
+  onDone,
+  onCancel,
+}) => {
+  const insets = useSafeAreaInsets();
+
+  if (!visible) return null;
+
+  const minEnd = addDays(start, RANGE_MIN_DAYS - 1);
+  const maxEnd = addDays(start, RANGE_MAX_DAYS - 1);
+
+  return (
+    <View style={rangeSheetStyles.backdrop}>
+      <View style={[rangeSheetStyles.topBar, { paddingTop: insets.top + 8 }]}>
+        <TouchableOpacity
+          onPress={onCancel}
+          style={rangeSheetStyles.topBarButton}
+          accessibilityRole="button"
+          accessibilityLabel="Cancel"
+        >
+          <AppText style={rangeSheetStyles.cancelText}>Cancel</AppText>
+        </TouchableOpacity>
+        <AppText style={rangeSheetStyles.title}>Select dates</AppText>
+        <TouchableOpacity
+          onPress={onDone}
+          style={rangeSheetStyles.topBarButton}
+          accessibilityRole="button"
+          accessibilityLabel="Done"
+        >
+          <AppText style={rangeSheetStyles.doneText}>Done</AppText>
+        </TouchableOpacity>
+      </View>
+
+      <View style={rangeSheetStyles.body}>
+        <AppText style={rangeSheetStyles.label}>Start date</AppText>
+        <DateTimePicker
+          value={start}
+          mode="date"
+          display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+          onChange={(_, date) => date && onChangeStart(date)}
+          textColor="#fff"
+        />
+
+        <AppText style={[rangeSheetStyles.label, { marginTop: 24 }]}>End date</AppText>
+        <DateTimePicker
+          value={end}
+          mode="date"
+          minimumDate={minEnd}
+          maximumDate={maxEnd}
+          display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+          onChange={(_, date) => date && onChangeEnd(date)}
+          textColor="#fff"
+        />
+
+        <AppText style={rangeSheetStyles.hint}>
+          Trips can be {RANGE_MIN_DAYS}–{RANGE_MAX_DAYS} days long.
+        </AppText>
+      </View>
+    </View>
+  );
+};
+
+const rangeSheetStyles = StyleSheet.create({
+  backdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0, 0, 0, 0.92)',
+    zIndex: 100,
+  },
+  topBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingBottom: 12,
+  },
+  topBarButton: {
+    paddingHorizontal: 4,
+    paddingVertical: 4,
+    minWidth: 60,
+  },
+  title: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: FONT_WEIGHTS.semibold,
+  },
+  cancelText: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: 16,
+  },
+  doneText: {
+    color: '#F5C842',
+    fontSize: 16,
+    fontWeight: FONT_WEIGHTS.semibold,
+    textAlign: 'right',
+  },
+  body: {
+    flex: 1,
+    alignItems: 'center',
+    paddingTop: 24,
+    paddingHorizontal: 32,
+  },
+  label: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: 14,
+    fontWeight: FONT_WEIGHTS.semibold,
+    marginBottom: 4,
+  },
+  hint: {
+    color: 'rgba(255,255,255,0.5)',
+    fontSize: 13,
+    marginTop: 24,
+    textAlign: 'center',
+  },
+});
 
 const overlayStyles = StyleSheet.create({
   backdrop: {
@@ -131,39 +291,16 @@ const overlayStyles = StyleSheet.create({
     paddingHorizontal: 32,
   },
   input: {
-    color: '#F5C842',
+    color: '#FFE600',
     fontSize: 24,
-    fontWeight: '800',
+    fontWeight: '500',
+    fontStyle: 'italic',
     textAlign: 'center',
     width: '100%',
     padding: 0,
-    fontFamily: FONTS.inter,
+    fontFamily: Platform.OS === 'ios' ? 'Helvetica' : FONTS.inter,
   },
 });
-
-function capitalize(s: string): string {
-  return s.charAt(0).toUpperCase() + s.slice(1);
-}
-
-function deriveTopLabel(entry: Entry): string {
-  const year = entry.timestamp ? new Date(entry.timestamp).getFullYear() : new Date().getFullYear();
-  return entry.country ? `${entry.country}, ${year}.` : `${year}.`;
-}
-
-function deriveBottomLabel(entry: Entry): string {
-  return entry.season
-    ? `Endless memories from ${capitalize(entry.season)}.`
-    : 'Endless memories.';
-}
-
-function samePhotoTransform(a: PostcardPhotoTransform, b: PostcardPhotoTransform): boolean {
-  const e = 1e-3;
-  return (
-    Math.abs(a.scale - b.scale) < e &&
-    Math.abs(a.translateX - b.translateX) < e &&
-    Math.abs(a.translateY - b.translateY) < e
-  );
-}
 
 function stateSnapshot(
   photos: (string | null)[],
@@ -175,61 +312,13 @@ function stateSnapshot(
   return JSON.stringify({ photos, labels, ratio, transforms, tplData });
 }
 
-/** Normalize template IDs: 'two-photo-stack' or 'T11' → 'T-11' */
-function normalizeTemplateId(id: string): string {
-  if (id === 'two-photo-stack' || id === 'T11') return 'T-11';
-  return id;
-}
-
-function loadTemplateComponent(templateId: string): React.ComponentType<any> | null {
-  const norm = normalizeTemplateId(templateId);
-  try {
-    switch (norm) {
-      case 'T-01':
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require('../components/postcards/templates/T01QuadCollageTemplate').default;
-      case 'T-02':
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require('../components/postcards/templates/T02CameraViewfinderTemplate').default;
-      case 'T-03':
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require('../components/postcards/templates/T03StatementCardTemplate').default;
-      case 'T-04':
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require('../components/postcards/templates/T04LayeredScrapbookTemplate').default;
-      case 'T-05':
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require('../components/postcards/templates/T05iMessageTemplate').default;
-      case 'T-06':
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require('../components/postcards/templates/T06VerticalTriptychTemplate').default;
-      case 'T-07':
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require('../components/postcards/templates/T07NotesJournalTemplate').default;
-      case 'T-08':
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require('../components/postcards/templates/T08NotesDataLogTemplate').default;
-      case 'T-09':
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require('../components/postcards/templates/T09MosaicCollageTemplate').default;
-      case 'T-10':
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require('../components/postcards/templates/T10MinimalPhotoTemplate').default;
-      case 'T-11':
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require('../components/postcards/templates/TwoPhotoStackTemplate').default;
-      case 'T-12':
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require('../components/postcards/templates/T12TriptychBadgeTemplate').default;
-      default:
-        // Fallback to T-11 for legacy IDs
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require('../components/postcards/templates/TwoPhotoStackTemplate').default;
-    }
-  } catch (e) {
-    logger.error('PostcardEditor: failed to load template', { templateId: norm, error: e });
-    return null;
-  }
+function samePhotoTransform(a: PostcardPhotoTransform, b: PostcardPhotoTransform): boolean {
+  const e = 1e-3;
+  return (
+    Math.abs(a.scale - b.scale) < e &&
+    Math.abs(a.translateX - b.translateX) < e &&
+    Math.abs(a.translateY - b.translateY) < e
+  );
 }
 
 const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
@@ -237,29 +326,34 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
   const insets = useSafeAreaInsets();
   const { colors } = useTheme();
   const { width: screenWidth } = useWindowDimensions();
-  const { postcards, createPostcard, updatePostcard } = useAppContext();
+  const { postcards, entries, createPostcard, updatePostcard } = useAppContext();
 
   const templateRef = useRef<View>(null);
 
-  const rawTemplateId = route.params?.templateId ?? 'T-11';
+  // `rawTemplateId` is state (not a plain const) because when opening an existing postcard for
+  // editing (SavedPostcardsScreen only passes `postcardId`), the real template isn't known until
+  // the load-existing-postcard effect below finds it and corrects this.
+  const [rawTemplateId, setRawTemplateId] = useState<string>(route.params?.templateId ?? 'T-11');
   const templateId = normalizeTemplateId(rawTemplateId);
   const isT11 = templateId === 'T-11';
+  const isMonthCalendar = templateId === 'T-07';
+  const isTriptychStamps = templateId === 'T-06';
+  const isLocationTag = templateId === 'T-04';
 
-  const registryEntry = getTemplateById(templateId);
-  const displayName = registryEntry?.displayName ?? 'Create Postcard';
+  const maxSlots = getMaxSlotsForTemplate(templateId);
 
   /** Loaded after mount so AppNavigator's initial require() of this file does not pull Reanimated. */
   const [TemplateComponent, setTemplateComponent] = useState<React.ComponentType<any> | null>(null);
   const [templateLoadError, setTemplateLoadError] = useState<string | null>(null);
 
   // --- Multi-slot state ---
-  const [photos, setPhotos] = useState<(string | null)[]>([null, null, null, null]);
+  const [photos, setPhotos] = useState<(string | null)[]>(() => Array(maxSlots).fill(null));
   const [labels, setLabels] = useState<string[]>(['', '', '', '']);
-  const [transforms, setTransforms] = useState<PostcardPhotoTransform[]>(
-    Array(4).fill(null).map(() => ({ ...DEFAULT_POSTCARD_PHOTO_TRANSFORM }))
+  const [transforms, setTransforms] = useState<PostcardPhotoTransform[]>(() =>
+    Array(maxSlots).fill(null).map(() => ({ ...DEFAULT_POSTCARD_PHOTO_TRANSFORM }))
   );
-  const [resetKeys, setResetKeys] = useState<number[]>([0, 0, 0, 0]);
-  const [slotEntries, setSlotEntries] = useState<(Entry | null)[]>([null, null, null, null]);
+  const [resetKeys, setResetKeys] = useState<number[]>(() => Array(maxSlots).fill(0));
+  const [slotEntries, setSlotEntries] = useState<(Entry | null)[]>(() => Array(maxSlots).fill(null));
   const [templateData, setTemplateData] = useState<Record<string, unknown>>({});
 
   const [activeSlot, setActiveSlot] = useState<number | null>(null);
@@ -291,26 +385,24 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
     if (!postcardId) return;
     const existing = postcards.find((p) => p.id === postcardId);
     if (!existing) return;
-    const p0 = existing.topPhotoPath ?? null;
-    const p1 = existing.bottomPhotoPath ?? null;
-    const p2 = existing.photo3Path ?? null;
-    const p3 = existing.photo4Path ?? null;
-    setPhotos([p0, p1, p2, p3]);
-    setLabels([existing.topLabel, existing.bottomLabel, '', '']);
-    const t0 = existing.topPhotoTransform ?? { ...DEFAULT_POSTCARD_PHOTO_TRANSFORM };
-    const t1 = existing.bottomPhotoTransform ?? { ...DEFAULT_POSTCARD_PHOTO_TRANSFORM };
-    const t2 = existing.photo3Transform ?? { ...DEFAULT_POSTCARD_PHOTO_TRANSFORM };
-    const t3 = existing.photo4Transform ?? { ...DEFAULT_POSTCARD_PHOTO_TRANSFORM };
-    setTransforms([t0, t1, t2, t3]);
+    // Correct the template (SavedPostcardsScreen only passes `postcardId`, not `templateId`).
+    setRawTemplateId(existing.templateId);
+    const loadedSlots = buildSlotsFromPostcard(existing, existing.templateId, entries);
+    const loadedPhotos = loadedSlots.map((s) => s.photoUri);
+    const loadedTransforms = loadedSlots.map((s) => s.transform);
+    setPhotos(loadedPhotos);
+    setTransforms(loadedTransforms);
+    setSlotEntries(loadedSlots.map((s) => s.entry));
+    setLabels([existing.label1, existing.label2, '', '']);
     setActiveRatio(existing.aspectRatio);
     setSavedPostcardId(existing.id);
     if (existing.templateData) setTemplateData(existing.templateData);
     setSavedSnapshot(
       stateSnapshot(
-        [p0, p1, p2, p3],
-        [existing.topLabel, existing.bottomLabel, '', ''],
+        loadedPhotos,
+        [existing.label1, existing.label2, '', ''],
         existing.aspectRatio,
-        [t0, t1, t2, t3],
+        loadedTransforms,
         existing.templateData ?? {}
       )
     );
@@ -326,7 +418,7 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
 
   const slots = useMemo<TemplateSlot[]>(
     () =>
-      [0, 1, 2, 3].map((i) => ({
+      photos.map((_, i) => ({
         photoUri: photos[i] ?? null,
         transform: transforms[i] ?? { ...DEFAULT_POSTCARD_PHOTO_TRANSFORM },
         resetKey: resetKeys[i] ?? 0,
@@ -338,6 +430,66 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
   const handleSlotPress = useCallback((slotIndex: number) => {
     setActiveSlot(slotIndex);
   }, []);
+
+  const handleChangeDataCategory = useCallback((category: TriptychDataCategory) => {
+    setTemplateData((prev) => ({
+      ...prev,
+      dataCategory: category,
+    }));
+  }, []);
+
+  const selectedDataCategory = useMemo(
+    () => (isTriptychStamps ? parseDataCategory(templateData) : 'temperature'),
+    [isTriptychStamps, templateData]
+  );
+
+  const handleChangeTagMode = useCallback((mode: LocationTagMode) => {
+    setTemplateData((prev) => ({ ...prev, locationTagMode: mode }));
+  }, []);
+
+  const handleChangeTagGranularity = useCallback((granularity: LocationGranularity) => {
+    setTemplateData((prev) => ({ ...prev, locationGranularity: granularity }));
+  }, []);
+
+  const selectedTagMode = useMemo(
+    () => (isLocationTag ? resolveTagMode(slotEntries[0], templateData) : 'location'),
+    [isLocationTag, slotEntries, templateData]
+  );
+
+  const selectedTagGranularity = useMemo(
+    () => (isLocationTag ? parseLocationGranularity(templateData) : 'place'),
+    [isLocationTag, templateData]
+  );
+
+  const rangeLabel = useMemo(() => {
+    if (!isMonthCalendar) return '';
+    return formatDateRangeLabel(parseSelectedRange(templateData));
+  }, [isMonthCalendar, templateData]);
+
+  const [rangeSheetVisible, setRangeSheetVisible] = useState(false);
+  const [draftRangeStart, setDraftRangeStart] = useState<Date>(() => new Date());
+  const [draftRangeEnd, setDraftRangeEnd] = useState<Date>(() => addDays(new Date(), RANGE_MIN_DAYS - 1));
+
+  const handleOpenRangeSheet = useCallback(() => {
+    const range = parseSelectedRange(templateData);
+    const start = parseDateOnlyIso(range.start) ?? new Date();
+    const end = parseDateOnlyIso(range.end) ?? addDays(start, RANGE_MIN_DAYS - 1);
+    setDraftRangeStart(start);
+    setDraftRangeEnd(end);
+    setRangeSheetVisible(true);
+  }, [templateData]);
+
+  const handleDraftStartChange = useCallback((date: Date) => {
+    setDraftRangeStart(date);
+    setDraftRangeEnd((prevEnd) => clampEndToRange(date, prevEnd));
+  }, []);
+
+  const handleRangeDone = useCallback(() => {
+    setTemplateData((prev) => buildRangeTemplateData(prev, draftRangeStart, draftRangeEnd));
+    setRangeSheetVisible(false);
+  }, [draftRangeStart, draftRangeEnd]);
+
+  const handleRangeCancel = useCallback(() => setRangeSheetVisible(false), []);
 
   const handleTransformChange = useCallback((slotIndex: number, next: PostcardPhotoTransform) => {
     setTransforms((prev) => {
@@ -385,38 +537,36 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
   const handlePhotoSelect = useCallback(
     (uri: string, entry: Entry) => {
       if (activeSlot === null) return;
+      const slotIndex = activeSlot;
+      const nextSlotEntries = [...slotEntries];
+      nextSlotEntries[slotIndex] = entry;
+
       setPhotos((prev) => {
         const n = [...prev];
-        n[activeSlot] = uri;
+        n[slotIndex] = uri;
         return n;
       });
       setTransforms((prev) => {
         const n = [...prev];
-        n[activeSlot] = { ...DEFAULT_POSTCARD_PHOTO_TRANSFORM };
+        n[slotIndex] = { ...DEFAULT_POSTCARD_PHOTO_TRANSFORM };
         return n;
       });
-      setSlotEntries((prev) => {
-        const n = [...prev];
-        n[activeSlot] = entry;
-        return n;
-      });
-      if (activeSlot === 0) {
+      setSlotEntries(nextSlotEntries);
+
+      // Diptych: location on each photo; repeated location → bottom uses season/weather.
+      if (isT11 && (slotIndex === 0 || slotIndex === 1)) {
+        const [label1, label2] = deriveDiptychLabels(nextSlotEntries[0], nextSlotEntries[1]);
         setLabels((prev) => {
           const n = [...prev];
-          n[0] = deriveTopLabel(entry);
+          n[0] = label1;
+          n[1] = label2;
           return n;
         });
       }
-      if (activeSlot === 1) {
-        setLabels((prev) => {
-          const n = [...prev];
-          n[1] = deriveBottomLabel(entry);
-          return n;
-        });
-      }
+
       setActiveSlot(null);
     },
-    [activeSlot]
+    [activeSlot, isT11, slotEntries]
   );
 
   const handleSave = async (downloaded = false): Promise<string> => {
@@ -425,6 +575,12 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
       const now = new Date().toISOString();
       const existingId = savedPostcardId;
       const id = existingId ?? generateUUID();
+      const packed = packPostcardPhotoFields(photos, transforms);
+      const nextTemplateData = {
+        ...templateData,
+        slotEntryIds: slotEntries.map((e) => e?.id ?? null),
+        extraSlots: packed.extraSlots,
+      };
 
       const postcard: Postcard = {
         id,
@@ -434,21 +590,18 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
         updatedAt: now,
         templateId: rawTemplateId,
         aspectRatio: activeRatio,
-        topPhotoPath: photos[0] ?? null,
-        bottomPhotoPath: photos[1] ?? null,
-        photo3Path: photos[2] ?? null,
-        photo4Path: photos[3] ?? null,
-        topLabel: labels[0] ?? '',
-        bottomLabel: labels[1] ?? '',
+        photo1Path: packed.photo1Path,
+        photo2Path: packed.photo2Path,
+        photo3Path: packed.photo3Path,
+        photo4Path: packed.photo4Path,
+        label1: labels[0] ?? '',
+        label2: labels[1] ?? '',
         downloaded,
-        topPhotoTransform: transforms[0],
-        bottomPhotoTransform: transforms[1],
-        photo3Transform: transforms[2],
-        photo4Transform: transforms[3],
-        templateData: {
-          ...templateData,
-          slotEntryIds: slotEntries.map((e) => e?.id ?? null),
-        },
+        photo1Transform: packed.photo1Transform,
+        photo2Transform: packed.photo2Transform,
+        photo3Transform: packed.photo3Transform,
+        photo4Transform: packed.photo4Transform,
+        templateData: nextTemplateData,
       };
 
       if (existingId) {
@@ -458,16 +611,7 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
         setSavedPostcardId(id);
       }
 
-      const snap = stateSnapshot(
-        photos,
-        labels,
-        activeRatio,
-        transforms,
-        {
-          ...templateData,
-          slotEntryIds: slotEntries.map((e) => e?.id ?? null),
-        }
-      );
+      const snap = stateSnapshot(photos, labels, activeRatio, transforms, nextTemplateData);
       setSavedSnapshot(snap);
       return id;
     } finally {
@@ -489,7 +633,7 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
       if (status !== 'granted') {
         Alert.alert(
           'Permission needed',
-          'Allow JourneyOn to save to your photo library in Settings.'
+          'Allow Journey Onward to save to your photo library in Settings.'
         );
         return;
       }
@@ -507,6 +651,8 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
       await MediaLibrary.saveToLibraryAsync(uri);
       await handleSave(true);
       Alert.alert('Saved', 'Your postcard has been saved to your camera roll.');
+      const tripId = slotEntries.find(e => e?.albumId)?.albumId ?? null;
+      Analytics.onPostcardExported(tripId).catch(() => {});
     } catch {
       Alert.alert('Error', 'Something went wrong. Please try again.');
     } finally {
@@ -536,11 +682,7 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
           justifyContent: 'center',
           marginRight: 4,
         },
-        title: {
-          fontFamily: FONTS.inter,
-          fontSize: 20,
-          fontWeight: FONT_WEIGHTS.bold,
-          color: colors.textPrimary,
+        headerSpacer: {
           flex: 1,
         },
         headerActions: {
@@ -579,7 +721,72 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
           alignItems: 'center',
           justifyContent: 'center',
           paddingHorizontal: SPACING.lg,
+          paddingBottom: isMonthCalendar || isTriptychStamps || isLocationTag ? 16 : insets.bottom + 16,
+        },
+        monthSwitcherRow: {
+          flexDirection: 'row',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 8,
+          paddingVertical: 10,
           paddingBottom: insets.bottom + 16,
+        },
+        monthSwitcherLabel: {
+          fontFamily: FONTS.inter,
+          fontSize: 14,
+          fontWeight: FONT_WEIGHTS.semibold,
+          color: colors.textPrimary,
+          minWidth: 120,
+          textAlign: 'center',
+        },
+        dataCategoryRow: {
+          flexDirection: 'row',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 10,
+          paddingBottom: insets.bottom + 16,
+        },
+        dataCategoryButton: {
+          width: 44,
+          height: 44,
+          borderRadius: 22,
+          alignItems: 'center',
+          justifyContent: 'center',
+          backgroundColor: colors.surface,
+        },
+        dataCategoryButtonActive: {
+          backgroundColor: colors.textPrimary,
+        },
+        tagOptionsRow: {
+          flexDirection: 'row',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 10,
+          paddingBottom: 12,
+        },
+        tagOptionsRowLast: {
+          paddingBottom: insets.bottom + 16,
+        },
+        tagOptionButton: {
+          flexDirection: 'row',
+          alignItems: 'center',
+          gap: 6,
+          paddingHorizontal: 14,
+          paddingVertical: 9,
+          borderRadius: 18,
+          backgroundColor: colors.surface,
+        },
+        tagOptionButtonActive: {
+          backgroundColor: colors.textPrimary,
+        },
+        tagOptionText: {
+          fontFamily: FONTS.inter,
+          fontSize: 13,
+          fontWeight: FONT_WEIGHTS.semibold,
+          color: colors.textPrimary,
+        },
+        tagOptionTextActive: {
+          color: colors.background,
         },
         templateWrapper: {
           width: templateWidth,
@@ -596,35 +803,8 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
           textAlign: 'center',
           paddingHorizontal: 16,
         },
-        badgePickerRow: {
-          flexDirection: 'row',
-          gap: 8,
-          paddingHorizontal: SPACING.lg,
-          paddingBottom: 10,
-        },
-        badgePill: {
-          paddingHorizontal: 12,
-          paddingVertical: 6,
-          borderRadius: 20,
-          backgroundColor: colors.surfaceVariant,
-          borderWidth: 1,
-          borderColor: colors.border,
-        },
-        badgePillActive: {
-          backgroundColor: '#3A6B33',
-          borderColor: '#3A6B33',
-        },
-        badgePillText: {
-          fontFamily: FONTS.inter,
-          fontSize: 12,
-          color: colors.textSecondary,
-          fontWeight: FONT_WEIGHTS.semibold,
-        },
-        badgePillTextActive: {
-          color: '#fff',
-        },
       }),
-    [colors, insets, templateWidth]
+    [colors, insets, templateWidth, isMonthCalendar, isTriptychStamps, isLocationTag]
   );
 
   // T-11 (Diptych) uses the old-style props
@@ -669,6 +849,7 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
         onTemplateDataChange={setTemplateData}
         aspectRatio={aspectRatio}
         editingChromeSuppressed={editingChromeSuppressed}
+        allEntries={entries}
       />
     );
   };
@@ -685,7 +866,7 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
           <Ionicons name="chevron-back" size={24} color={colors.textPrimary} />
         </TouchableOpacity>
 
-        <AppText style={styles.title}>{displayName}</AppText>
+        <View style={styles.headerSpacer} />
 
         <View style={styles.headerActions}>
           <TouchableOpacity
@@ -746,33 +927,6 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
         })}
       </View>
 
-      {/* T-12 badge type picker */}
-      {templateId === 'T-12' && (
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.badgePickerRow}
-        >
-          {BADGE_TYPE_OPTIONS.map((opt) => {
-            const isActive = (templateData.badgeType ?? 'temperature') === opt;
-            return (
-              <TouchableOpacity
-                key={opt}
-                style={[styles.badgePill, isActive && styles.badgePillActive]}
-                onPress={() => setTemplateData((prev) => ({ ...prev, badgeType: opt }))}
-                activeOpacity={0.7}
-                accessibilityRole="button"
-                accessibilityLabel={`Badge type: ${opt}${isActive ? ', selected' : ''}`}
-              >
-                <AppText style={[styles.badgePillText, isActive && styles.badgePillTextActive]}>
-                  {opt}
-                </AppText>
-              </TouchableOpacity>
-            );
-          })}
-        </ScrollView>
-      )}
-
       <View style={styles.canvasArea}>
         <View style={styles.templateWrapper}>
           {templateLoadError !== null ? (
@@ -794,6 +948,93 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
         </View>
       </View>
 
+      {isMonthCalendar && (
+        <TouchableOpacity
+          style={styles.monthSwitcherRow}
+          onPress={handleOpenRangeSheet}
+          accessibilityRole="button"
+          accessibilityLabel={`Change date range, currently ${rangeLabel}`}
+        >
+          <Ionicons name="calendar-outline" size={18} color={colors.textPrimary} />
+          <AppText style={styles.monthSwitcherLabel}>{rangeLabel}</AppText>
+          <Ionicons name="chevron-down" size={16} color={colors.textSecondary} />
+        </TouchableOpacity>
+      )}
+
+      {isTriptychStamps && (
+        <View style={styles.dataCategoryRow}>
+          {TRIPTYCH_DATA_CATEGORIES.map(({ key, label, icon }) => {
+            const isActive = selectedDataCategory === key;
+            return (
+              <TouchableOpacity
+                key={key}
+                style={[styles.dataCategoryButton, isActive && styles.dataCategoryButtonActive]}
+                onPress={() => handleChangeDataCategory(key)}
+                accessibilityRole="button"
+                accessibilityLabel={`Show ${label.toLowerCase()}`}
+                accessibilityState={{ selected: isActive }}
+              >
+                <Ionicons
+                  name={icon}
+                  size={22}
+                  color={isActive ? colors.background : colors.textPrimary}
+                />
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      )}
+
+      {isLocationTag && (
+        <View
+          style={[
+            styles.tagOptionsRow,
+            selectedTagMode !== 'location' && styles.tagOptionsRowLast,
+          ]}
+        >
+          {LOCATION_TAG_MODES.map(({ key, label, icon }) => {
+            const isActive = selectedTagMode === key;
+            return (
+              <TouchableOpacity
+                key={key}
+                style={[styles.tagOptionButton, isActive && styles.tagOptionButtonActive]}
+                onPress={() => handleChangeTagMode(key)}
+                accessibilityRole="button"
+                accessibilityLabel={`Show ${label.toLowerCase()} tag`}
+                accessibilityState={{ selected: isActive }}
+              >
+                <Ionicons name={icon} size={16} color={isActive ? colors.background : colors.textPrimary} />
+                <AppText style={[styles.tagOptionText, isActive && styles.tagOptionTextActive]}>
+                  {label}
+                </AppText>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      )}
+
+      {isLocationTag && selectedTagMode === 'location' && (
+        <View style={[styles.tagOptionsRow, styles.tagOptionsRowLast]}>
+          {LOCATION_GRANULARITIES.map(({ key, label }) => {
+            const isActive = selectedTagGranularity === key;
+            return (
+              <TouchableOpacity
+                key={key}
+                style={[styles.tagOptionButton, isActive && styles.tagOptionButtonActive]}
+                onPress={() => handleChangeTagGranularity(key)}
+                accessibilityRole="button"
+                accessibilityLabel={`Show ${label.toLowerCase()}`}
+                accessibilityState={{ selected: isActive }}
+              >
+                <AppText style={[styles.tagOptionText, isActive && styles.tagOptionTextActive]}>
+                  {label}
+                </AppText>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      )}
+
       <PhotoPickerSheet
         visible={activeSlot !== null}
         onClose={() => setActiveSlot(null)}
@@ -807,6 +1048,16 @@ const PostcardEditorScreen: React.FC<Props> = ({ route }) => {
           onDone={handleEditDone}
         />
       )}
+
+      <DateRangeSheet
+        visible={rangeSheetVisible}
+        start={draftRangeStart}
+        end={draftRangeEnd}
+        onChangeStart={handleDraftStartChange}
+        onChangeEnd={setDraftRangeEnd}
+        onDone={handleRangeDone}
+        onCancel={handleRangeCancel}
+      />
     </View>
   );
 };

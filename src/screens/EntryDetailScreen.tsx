@@ -287,7 +287,7 @@ const EntryDetailScreen: React.FC = () => {
         if (status !== 'granted') {
           Alert.alert(
             'Permission needed',
-            'JourneyOn needs access to your photo library to save images.'
+            'Journey Onward needs access to your photo library to save images.'
           );
           return;
         }
@@ -822,8 +822,8 @@ const EntryDetailScreen: React.FC = () => {
 
           {/* Title (flow layout) */}
           <View style={[styles.sectionPadding, { marginTop: 16 }]}>
-            {(entry.title || entry.isAwe) ? (
-              entry.isAwe ? (
+            {(entry.title || entry.isBookmarked) ? (
+              entry.isBookmarked ? (
                 <View style={[styles.titleRow, { minHeight: 24 * scaleFactor }]}>
                   <MaskedView
                     style={{ flexDirection: 'row', alignItems: 'center', flex: 1, minHeight: 24 * scaleFactor }}

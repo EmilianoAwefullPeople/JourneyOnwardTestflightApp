@@ -10,7 +10,8 @@ const BASE_WIDTH = 390; // iPhone standard reference width
 
 export const COLORS = {
   // Primary colors from Figma
-  lime800: '#3A6B33', // Dark green (primary accent, splash background)
+  lime800: '#3A6B33', // Dark green (primary accent)
+  splashBackground: '#171717', // Native splash + bootstrap placeholder (matches app.json)
   neutral900: '#141212', // Dark background (main app background)
   white: '#FFFFFF',
   black: '#141212',

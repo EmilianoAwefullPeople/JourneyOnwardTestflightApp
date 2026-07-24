@@ -111,9 +111,42 @@ function toHex(rgb: RGB): string {
   return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
 }
 
+// Saturation/lightness (HSL) from 0-255 RGB — cheap, no cube roots, used only to
+// rerank the final ≤numColors output boxes (never touches the histogram/split logic).
+function rgbSaturationLightness([r, g, b]: RGB): { s: number; l: number } {
+  const rn = r / 255, gn = g / 255, bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const l = (max + min) / 2;
+  if (max === min) return { s: 0, l };
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  return { s, l };
+}
+
+const VIVID_BOOST = 0.7; // max score multiplier ~1.7x for a fully saturated box
+const EXTREME_LIGHTNESS_PENALTY = 0.5; // near-black/near-white boxes are likely clipped shadow/highlight, not a surface color
+
+// A box needs at least this share of the sampled pixels to earn the vivid boost.
+// Small, highly-saturated boxes are more likely to be noise (chromatic-aberration
+// fringing at high-contrast edges, specular highlights) than a real surface color —
+// below this share, rank on pixel count alone so noise can't outrank real regions.
+const MIN_SIGNIFICANCE_SHARE = 0.02;
+
+// Bounded so a small vivid region can only outrank boxes of comparable pixel count —
+// a large neutral wall/sky region still wins over a tiny saturated speck.
+function dominanceScore(vbox: VBox, totalCount: number): number {
+  if (vbox.count / totalCount < MIN_SIGNIFICANCE_SHARE) return vbox.count;
+  const { s, l } = rgbSaturationLightness(vbox.avg);
+  const isExtreme = l < 0.06 || l > 0.94;
+  const boost = 1 + VIVID_BOOST * s * (isExtreme ? EXTREME_LIGHTNESS_PENALTY : 1);
+  return vbox.count * boost;
+}
+
 /**
  * Returns `numColors` dominant colors from the pixel array as hex strings,
- * sorted by descending pixel count (most dominant first).
+ * sorted by descending dominance (pixel count, boosted for saturated/vivid
+ * colors over muddy/clipped ones — most dominant-and-vivid first).
  *
  * Falls back to fewer colors if the image doesn't have enough distinct regions.
  */
@@ -160,7 +193,8 @@ export function mmcq(pixels: RGB[], numColors: number): string[] {
     if (rightPixels.length > 0) queue.push({ vbox: right, pixels: rightPixels });
   }
 
-  // Sort by count descending and convert averages to hex
-  queue.sort((a, b) => b.vbox.count - a.vbox.count);
+  // Sort by dominance score (pixel count, boosted for vivid colors) and convert averages to hex
+  const totalCount = pixels.length;
+  queue.sort((a, b) => dominanceScore(b.vbox, totalCount) - dominanceScore(a.vbox, totalCount));
   return queue.slice(0, numColors).map(({ vbox }) => toHex(vbox.avg));
 }

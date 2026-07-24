@@ -37,17 +37,19 @@ import type {
   SuggestedExperienceWithDisplayUris,
 } from '../services/ImportLatestService';
 import { isImportLatestAbortedError } from '../services/ImportLatestService';
+
 import * as ImagePicker from 'expo-image-picker';
 import {
   discoverExperienceSuggestions,
   persistSelectedExperiences,
 } from '../services/ExperienceImportService';
 import { ANIMATION_CONFIG, createStaggeredDelay } from '../utils/animations';
-import { getCountryFlagEmoji, getKnownCountryNames } from '../utils/countryUtils';
+import { mapWithConcurrency } from '../utils/concurrency';
 import LoadingSpinner from '../components/common/LoadingSpinner';
+import { FlashList } from '@shopify/flash-list';
 
 type ImportLatestNavigationProp = NativeStackNavigationProp<RootStackParamList, 'ImportLatest'>;
-type SyncMode = 'date' | 'country' | 'gallery';
+type SyncMode = 'date' | 'gallery';
 
 /** One decimal, clamped 0–100, for import progress bar label. */
 function formatImportProgressPercent(percent: number): string {
@@ -58,7 +60,7 @@ function formatImportProgressPercent(percent: number): string {
 type ScreenState = 'filter' | 'loading' | 'list' | 'saving' | 'done' | 'error';
 type QuickFilter = 'last24h' | 'last72h' | 'custom';
 
-const GALLERY_SELECTION_LIMIT = 50;
+const GALLERY_SELECTION_LIMIT = 500;
 
 const ImportLatestScreen: React.FC = () => {
   const navigation = useNavigation<ImportLatestNavigationProp>();
@@ -70,9 +72,6 @@ const ImportLatestScreen: React.FC = () => {
   const [syncMode, setSyncMode] = useState<SyncMode | null>(null);
   const [isAwaitingGallery, setIsAwaitingGallery] = useState(false);
   const [selectedFilter, setSelectedFilter] = useState<QuickFilter>('last72h');
-  const [selectedCountry, setSelectedCountry] = useState<string | null>(null);
-  const [selectedYears, setSelectedYears] = useState<number[]>([]);
-  const [isYearPickerOpen, setIsYearPickerOpen] = useState(false);
   const [customStartDate, setCustomStartDate] = useState<Date>(() => {
     const now = new Date();
     const prior = new Date(now.getTime());
@@ -92,6 +91,7 @@ const ImportLatestScreen: React.FC = () => {
   const [progressPercent, setProgressPercent] = useState(0);
   const [progressLabel, setProgressLabel] = useState('Preparing import…');
   const [progressDetail, setProgressDetail] = useState('');
+  const [placeLabelsBySuggestionId, setPlaceLabelsBySuggestionId] = useState<Map<string, string>>(new Map());
 
   const importScanAbortRef = useRef<AbortController | null>(null);
   const importSaveAbortRef = useRef<AbortController | null>(null);
@@ -108,27 +108,55 @@ const ImportLatestScreen: React.FC = () => {
     };
   }, [navigation]);
 
-  const countryOptions = useMemo(() => getKnownCountryNames(), []);
-  const yearOptions = useMemo(() => {
-    const currentYear = new Date().getFullYear();
-    const oldestSelectableYear = 1970;
-    const years: number[] = [];
-    for (let year = currentYear; year >= oldestSelectableYear; year--) {
-      years.push(year);
+  // Batch-geocode suggestion cards in the parent to avoid up to 12 burst CLGeocoder calls.
+  // Dedup by coordinate bucket so nearby suggestions share one API call.
+  useEffect(() => {
+    if (suggestions.length === 0) return;
+    let cancelled = false;
+
+    const coordBucketToSuggestionIds = new Map<string, string[]>();
+    const bucketToCoord = new Map<string, { lat: number; lng: number }>();
+
+    for (const s of suggestions) {
+      if (s.latitude == null || s.longitude == null) continue;
+      const bucket = `${s.latitude.toFixed(2)},${s.longitude.toFixed(2)}`;
+      if (!coordBucketToSuggestionIds.has(bucket)) {
+        coordBucketToSuggestionIds.set(bucket, []);
+        bucketToCoord.set(bucket, { lat: s.latitude, lng: s.longitude });
+      }
+      coordBucketToSuggestionIds.get(bucket)!.push(s.id);
     }
-    return years;
-  }, []);
-  const availableYearChoices = useMemo(
-    () => yearOptions.filter((year) => !selectedYears.includes(year)),
-    [yearOptions, selectedYears]
-  );
+
+    const uniqueBuckets = Array.from(coordBucketToSuggestionIds.keys());
+    if (uniqueBuckets.length === 0) return;
+
+    (async () => {
+      const labelMap = new Map<string, string>();
+      await mapWithConcurrency(uniqueBuckets, 4, async (bucket) => {
+        if (cancelled) return;
+        const coord = bucketToCoord.get(bucket);
+        if (!coord) return;
+        try {
+          const label = await reverseGeocode(coord.lat, coord.lng);
+          if (label && !cancelled) {
+            for (const id of coordBucketToSuggestionIds.get(bucket) ?? []) {
+              labelMap.set(id, label);
+            }
+          }
+        } catch {
+          // Soft-fail; card shows 'Unknown place'
+        }
+      });
+      if (!cancelled) setPlaceLabelsBySuggestionId(new Map(labelMap));
+    })();
+
+    return () => { cancelled = true; };
+  }, [suggestions]);
 
   const runScan = useCallback(
     async (
       range: ImportLatestRange | undefined,
       rangeLabel: string,
-      countryName?: string,
-      years?: number[]
     ) => {
     setState('loading');
     setErrorMessage('');
@@ -145,17 +173,13 @@ const ImportLatestScreen: React.FC = () => {
         kind: 'latest',
         options: {
           range,
-          countryName,
-          selectedYears: years,
           signal: scanController.signal,
           onProgress: (progress: ImportLatestProgress) => {
             setProgressPercent(progress.percent);
             setProgressLabel(progress.label);
             const showCounts =
               progress.total > 0 &&
-              (progress.total > 1 ||
-                progress.phase === 'fetch' ||
-                progress.phase === 'country');
+              (progress.total > 1 || progress.phase === 'fetch');
             if (showCounts) {
               setProgressDetail(`${progress.completed}/${progress.total}`);
             } else {
@@ -170,7 +194,7 @@ const ImportLatestScreen: React.FC = () => {
         return;
       }
       setSuggestions(result.suggestions);
-      setAcceptedIds(new Set());
+      setAcceptedIds(new Set(result.suggestions.map((s) => s.id)));
       setProgressPercent(100);
       setProgressLabel('Suggestions ready');
       setProgressDetail('');
@@ -210,17 +234,6 @@ const ImportLatestScreen: React.FC = () => {
       setFilterError('Please choose how to sync first.');
       return;
     }
-    if (syncMode === 'country') {
-      const countryName = selectedCountry?.trim();
-      const years = [...selectedYears].sort((a, b) => a - b);
-      if (!countryName || years.length === 0) {
-        setFilterError('Please select at least one year.');
-        return;
-      }
-      const yearsLabel = years.length === 1 ? `${years[0]}` : `${years[0]}-${years[years.length - 1]}`;
-      runScan(undefined, `${countryName} (${yearsLabel})`, countryName, years);
-      return;
-    }
     if (selectedFilter !== 'custom') {
       startScanForFilter(selectedFilter);
       return;
@@ -251,20 +264,10 @@ const ImportLatestScreen: React.FC = () => {
     customEndDate,
     customStartDate,
     runScan,
-    selectedCountry,
-    selectedYears,
     selectedFilter,
     startScanForFilter,
     syncMode,
   ]);
-
-  const addYear = useCallback((year: number) => {
-    setSelectedYears((prev) => {
-      if (prev.includes(year)) return prev;
-      return [...prev, year].sort((a, b) => b - a);
-    });
-    setIsYearPickerOpen(false);
-  }, []);
 
   const toggleAccept = useCallback((id: string) => {
     setAcceptedIds((prev) => {
@@ -293,6 +296,7 @@ const ImportLatestScreen: React.FC = () => {
     importSaveAbortRef.current = saveController;
 
     setState('saving');
+    setProgressLabel('Saving experiences…');
     setSchemaFailureNotice('');
     try {
       const result = await persistSelectedExperiences({
@@ -303,6 +307,9 @@ const ImportLatestScreen: React.FC = () => {
         createEntry,
         refreshData,
         signal: saveController.signal,
+        onProgress: (completed, total) => {
+          setProgressLabel(`Saving ${completed} of ${total}…`);
+        },
       });
       if (saveController.signal.aborted) {
         return;
@@ -352,9 +359,6 @@ const ImportLatestScreen: React.FC = () => {
   const handleChangeFilter = useCallback(() => {
     setFilterError('');
     setSyncMode(null);
-    setSelectedCountry(null);
-    setSelectedYears([]);
-    setIsYearPickerOpen(false);
     setState('filter');
   }, []);
 
@@ -401,6 +405,7 @@ const ImportLatestScreen: React.FC = () => {
         height: a.height,
         assetId: a.assetId ?? null,
         exif: (a.exif as Record<string, unknown> | null | undefined) ?? null,
+        fileSize: a.fileSize,
       }));
 
       const importResult = await discoverExperienceSuggestions({
@@ -423,7 +428,7 @@ const ImportLatestScreen: React.FC = () => {
       }
 
       setSuggestions(importResult.suggestions);
-      setAcceptedIds(new Set());
+      setAcceptedIds(new Set(importResult.suggestions.map((s) => s.id)));
       setProgressPercent(100);
       setProgressLabel('Suggestions ready');
       setProgressDetail('');
@@ -444,15 +449,25 @@ const ImportLatestScreen: React.FC = () => {
   }, []);
 
   const acceptedCount = acceptedIds.size;
+
+  const handleSelectAll = useCallback(() => {
+    setAcceptedIds(new Set(suggestions.map((s) => s.id)));
+  }, [suggestions]);
+
+  const handleDeselectAll = useCallback(() => {
+    setAcceptedIds(new Set());
+  }, []);
+
+  const totalPhotosInAccepted = useMemo(
+    () => suggestions.filter((s) => acceptedIds.has(s.id)).reduce((sum, s) => sum + s.totalPhotos, 0),
+    [suggestions, acceptedIds]
+  );
   const isCustomRangeInvalid = customStartDate.getTime() > customEndDate.getTime();
   const isDateMode = syncMode === 'date';
-  const isCountryMode = syncMode === 'country';
   const isGalleryMode = syncMode === 'gallery';
   const isScanDisabled =
     !syncMode ||
-    (isDateMode && selectedFilter === 'custom' && isCustomRangeInvalid) ||
-    (isCountryMode &&
-      (!selectedCountry || selectedCountry.trim().length === 0 || selectedYears.length === 0));
+    (isDateMode && selectedFilter === 'custom' && isCustomRangeInvalid);
   const styles = useMemo(
     () =>
       createStyles(colors as ThemeColors, insets),
@@ -502,33 +517,11 @@ const ImportLatestScreen: React.FC = () => {
             <TouchableOpacity
               style={[
                 styles.modeFilterButton,
-                syncMode !== null && !isCountryMode && styles.modeFilterButtonInactive,
-              ]}
-              onPress={() => {
-                setFilterError('');
-                setSyncMode('country');
-                setSelectedCountry(null);
-                setSelectedYears([]);
-                setIsYearPickerOpen(false);
-              }}
-              activeOpacity={0.7}
-            >
-              <View style={styles.modeFilterButtonContent}>
-                <Ionicons name="earth-outline" size={18} color={colors.textPrimary} />
-                <Text style={[styles.filterOptionText, { color: colors.textPrimary }]}>Country</Text>
-              </View>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[
-                styles.modeFilterButton,
                 syncMode !== null && !isGalleryMode && styles.modeFilterButtonInactive,
               ]}
               onPress={() => {
                 setFilterError('');
                 setSyncMode('gallery');
-                setSelectedCountry(null);
-                setSelectedYears([]);
-                setIsYearPickerOpen(false);
                 handlePickFromGallery();
               }}
               activeOpacity={0.7}
@@ -606,117 +599,6 @@ const ImportLatestScreen: React.FC = () => {
             </View>
           )}
 
-          {isCountryMode && (
-            <View style={styles.filterDetailSection}>
-              <ScrollView
-                style={styles.countryScrollOuter}
-                contentContainerStyle={styles.countryScrollContent}
-                nestedScrollEnabled
-                showsVerticalScrollIndicator
-              >
-                {countryOptions.map((country, index) => {
-                  const isSelected = selectedCountry === country;
-                  const flag = getCountryFlagEmoji(country);
-                  const showFlag = flag !== '🌍';
-                  const isLast = index === countryOptions.length - 1;
-                  return (
-                    <TouchableOpacity
-                      key={country}
-                      style={[
-                        styles.countryRow,
-                        !isLast && styles.countryRowBorder,
-                        !isLast && { borderBottomColor: colors.border },
-                        isSelected && { backgroundColor: colors.surfaceVariant },
-                      ]}
-                      onPress={() => {
-                        setSelectedCountry(country);
-                        setSelectedYears([]);
-                        setIsYearPickerOpen(false);
-                        setFilterError('');
-                      }}
-                      activeOpacity={0.7}
-                    >
-                      {showFlag ? (
-                        <Text style={styles.countryRowFlag} accessibilityLabel={`${country} flag`}>
-                          {flag}
-                        </Text>
-                      ) : (
-                        <View style={styles.countryRowFlagSpacer} />
-                      )}
-                      <Text style={[styles.countryRowName, { color: colors.textPrimary }]}>{country}</Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </ScrollView>
-
-              {selectedCountry && (
-                <View style={styles.yearSection}>
-                  <Text style={styles.yearSectionTitle}>When were you there?</Text>
-                  {yearOptions.length > 0 && (
-                    <View style={styles.yearPickerWrap}>
-                      <View style={styles.selectedYearsRow}>
-                        {selectedYears.map((year) => (
-                          <View key={year} style={[styles.selectedYearPill, { borderColor: colors.border }]}>
-                            <Text style={[styles.selectedYearText, { color: colors.textPrimary }]}>{year}</Text>
-                          </View>
-                        ))}
-                        {availableYearChoices.length > 0 && (
-                          <TouchableOpacity
-                            style={[styles.addYearButton, { borderColor: colors.border }]}
-                            onPress={() => setIsYearPickerOpen((prev) => !prev)}
-                            activeOpacity={0.7}
-                          >
-                            <Text style={[styles.addYearButtonText, { color: colors.textPrimary }]}>+</Text>
-                          </TouchableOpacity>
-                        )}
-                      </View>
-                      {isYearPickerOpen && (
-                        <View style={[styles.yearPickerList, { borderColor: colors.border }]}>
-                          <ScrollView
-                            style={styles.yearPickerListScroll}
-                            nestedScrollEnabled
-                            showsVerticalScrollIndicator
-                          >
-                            {availableYearChoices.map((year, index) => {
-                              const isLast = index === availableYearChoices.length - 1;
-                              return (
-                                <TouchableOpacity
-                                  key={year}
-                                  style={[
-                                    styles.yearPickerRow,
-                                    !isLast && styles.yearPickerRowBorder,
-                                    !isLast && { borderBottomColor: colors.border },
-                                  ]}
-                                  onPress={() => addYear(year)}
-                                  activeOpacity={0.7}
-                                >
-                                  <Text style={[styles.yearPickerRowText, { color: colors.textPrimary }]}>{year}</Text>
-                                </TouchableOpacity>
-                              );
-                            })}
-                          </ScrollView>
-                        </View>
-                      )}
-                    </View>
-                  )}
-                </View>
-              )}
-
-              {filterError.length > 0 ? <Text style={styles.filterErrorText}>{filterError}</Text> : null}
-
-              <TouchableOpacity
-                style={[
-                  styles.scanButton,
-                  isScanDisabled && styles.scanButtonDisabled,
-                ]}
-                onPress={handleStartScan}
-                activeOpacity={0.7}
-                disabled={isScanDisabled}
-              >
-                <Text style={styles.scanButtonText}>Scan photos</Text>
-              </TouchableOpacity>
-            </View>
-          )}
           {isGalleryMode && (
             <View style={styles.filterDetailSection}>
               <Text style={[styles.galleryHint, { color: colors.textSecondary }]}>
@@ -845,7 +727,7 @@ const ImportLatestScreen: React.FC = () => {
         <MeshGradientBackground baseColor={colors.background} lightMode={!isDark} />
         <View style={styles.centerContent}>
           <LoadingSpinner size="large" />
-          <Text style={styles.loadingText}>Adding experiences…</Text>
+          <Text style={styles.loadingText}>{progressLabel}</Text>
         </View>
       </View>
     );
@@ -854,9 +736,7 @@ const ImportLatestScreen: React.FC = () => {
   // state === 'list'
   const emptyAfterScan = suggestions.length === 0;
   if (emptyAfterScan) {
-    const emptyMessage = isCountryMode
-      ? `No moments found for ${activeRangeLabel}.`
-      : `No recent moments in ${activeRangeLabel}.`;
+    const emptyMessage = `No recent moments in ${activeRangeLabel}.`;
     return (
       <View style={styles.container}>
         <MeshGradientBackground baseColor={colors.background} lightMode={!isDark} />
@@ -885,6 +765,28 @@ const ImportLatestScreen: React.FC = () => {
     );
   }
 
+  const allSelected = suggestions.length > 0 && acceptedCount === suggestions.length;
+
+  const renderBatchControls = () => (
+    <View style={styles.batchControls}>
+      <Text style={[styles.batchSummary, { color: colors.textSecondary }]}>
+        {suggestions.length} moment{suggestions.length !== 1 ? 's' : ''}
+        {acceptedCount > 0 ? ` · ${acceptedCount} selected · ${totalPhotosInAccepted} photo${totalPhotosInAccepted !== 1 ? 's' : ''}` : ''}
+      </Text>
+      <View style={styles.batchButtons}>
+        <TouchableOpacity
+          onPress={allSelected ? handleDeselectAll : handleSelectAll}
+          style={[styles.batchBtn, { borderColor: colors.border }]}
+          activeOpacity={0.7}
+        >
+          <Text style={[styles.batchBtnText, { color: colors.textPrimary }]}>
+            {allSelected ? 'Deselect all' : 'Select all'}
+          </Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+
   return (
     <View style={styles.container}>
       <MeshGradientBackground baseColor={colors.background} lightMode={!isDark} />
@@ -897,14 +799,11 @@ const ImportLatestScreen: React.FC = () => {
           <Text style={styles.headerActionText}>Change filter</Text>
         </TouchableOpacity>
       </View>
-      <ScrollView
-        style={styles.scroll}
-        contentContainerStyle={styles.scrollContent}
-        showsVerticalScrollIndicator
-      >
-        {suggestions.map((suggestion, index) => (
+      <FlashList
+        data={suggestions}
+        keyExtractor={(item) => item.id}
+        renderItem={({ item: suggestion, index }) => (
           <SuggestionCard
-            key={suggestion.id}
             suggestion={suggestion}
             index={index}
             isAccepted={acceptedIds.has(suggestion.id)}
@@ -912,10 +811,17 @@ const ImportLatestScreen: React.FC = () => {
             onSkip={() => skip(suggestion.id)}
             colors={colors as ThemeColors}
             formatDate={formatEntryDate}
-            hideCountryLabel={isCountryMode}
+            placeLabel={placeLabelsBySuggestionId.get(suggestion.id)}
           />
-        ))}
-      </ScrollView>
+        )}
+        ListHeaderComponent={renderBatchControls}
+        contentContainerStyle={{
+          paddingBottom: acceptedCount > 0
+            ? insets.bottom + SPACING.md + 72
+            : insets.bottom + SPACING.md,
+        }}
+        showsVerticalScrollIndicator={false}
+      />
       {acceptedCount > 0 && (
         <View style={[styles.footer, { paddingBottom: insets.bottom + SPACING.md }]}>
           <TouchableOpacity
@@ -923,7 +829,9 @@ const ImportLatestScreen: React.FC = () => {
             onPress={handleAddExperiences}
             activeOpacity={0.7}
           >
-            <Text style={styles.addButtonText}>Add {acceptedCount} experience{acceptedCount !== 1 ? 's' : ''}</Text>
+            <Text style={styles.addButtonText}>
+              Add {acceptedCount} moment{acceptedCount !== 1 ? 's' : ''} · {totalPhotosInAccepted} photo{totalPhotosInAccepted !== 1 ? 's' : ''}
+            </Text>
           </TouchableOpacity>
         </View>
       )}
@@ -946,7 +854,7 @@ function SuggestionCard({
   onSkip,
   colors,
   formatDate,
-  hideCountryLabel,
+  placeLabel: placeLabelProp,
 }: {
   suggestion: SuggestedExperienceWithDisplayUris;
   index: number;
@@ -955,10 +863,13 @@ function SuggestionCard({
   onSkip: () => void;
   colors: ThemeColors;
   formatDate: (timestamp: string) => string;
-  hideCountryLabel: boolean;
+  placeLabel?: string;
 }) {
   const opacity = useRef(new Animated.Value(0)).current;
-  const [placeLabel, setPlaceLabel] = useState<string>('Unknown place');
+  const placeLabel = placeLabelProp ?? 'Unknown place';
+  const photoCountLabel = suggestion.totalPhotos > suggestion.assets.length
+    ? `${suggestion.totalPhotos} photos`
+    : null;
   const [currentImageIndex, setCurrentImageIndex] = useState(0);
   const [mediaWidth, setMediaWidth] = useState(320);
   const mediaFlatListRef = useRef<FlatList<string>>(null);
@@ -982,16 +893,6 @@ function SuggestionCard({
     }).start();
   }, [index, opacity]);
 
-  useEffect(() => {
-    if (suggestion.latitude == null || suggestion.longitude == null) return;
-    let cancelled = false;
-    reverseGeocode(suggestion.latitude, suggestion.longitude).then((name) => {
-      if (!cancelled && name) setPlaceLabel(name);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [suggestion.latitude, suggestion.longitude]);
 
   useEffect(() => {
     if (imageUris.length === 0) {
@@ -1064,7 +965,7 @@ function SuggestionCard({
           pointerEvents="none"
         />
 
-        {!hideCountryLabel && countryLabel.length > 0 && (
+        {countryLabel.length > 0 && (
           <Text style={cardStyles.feedCountry} numberOfLines={1} maxFontSizeMultiplier={1.2}>
             {countryLabel}
           </Text>
@@ -1092,6 +993,12 @@ function SuggestionCard({
                 ]}
               />
             ))}
+          </View>
+        )}
+
+        {photoCountLabel && (
+          <View style={cardStyles.photoCountPill}>
+            <Text style={cardStyles.photoCountText}>{photoCountLabel}</Text>
           </View>
         )}
       </View>
@@ -1222,6 +1129,21 @@ const cardStyles = StyleSheet.create({
   },
   mediaDotInactive: {
     backgroundColor: 'rgba(255,255,255,0.35)',
+  },
+  photoCountPill: {
+    position: 'absolute',
+    bottom: 14,
+    left: 16,
+    backgroundColor: 'rgba(0,0,0,0.52)',
+    borderRadius: 20,
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+  },
+  photoCountText: {
+    color: '#FFFFFF',
+    fontFamily: FONTS.inter,
+    fontSize: 12,
+    fontWeight: FONT_WEIGHTS.semibold,
   },
   actions: {
     flexDirection: 'row',
@@ -1374,116 +1296,6 @@ function createStyles(colors: ThemeColors, insets: { top: number; bottom: number
       borderRadius: 12,
       paddingVertical: SPACING.sm,
       backgroundColor: colors.surfaceVariant,
-    },
-    countryScrollOuter: {
-      marginTop: SPACING.md,
-      marginBottom: SPACING.md,
-      maxHeight: 380,
-      borderWidth: 1,
-      borderColor: colors.border,
-      borderRadius: 12,
-      backgroundColor: colors.background,
-      overflow: 'hidden',
-    },
-    countryScrollContent: {
-      paddingBottom: SPACING.xs,
-    },
-    countryRow: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      paddingVertical: SPACING.md,
-      paddingHorizontal: SPACING.md,
-      minHeight: 52,
-    },
-    countryRowBorder: {
-      borderBottomWidth: StyleSheet.hairlineWidth,
-    },
-    countryRowFlag: {
-      fontSize: 22,
-      lineHeight: 28,
-      width: 40,
-      textAlign: 'center',
-      marginRight: SPACING.sm,
-    },
-    countryRowFlagSpacer: {
-      width: 40,
-      marginRight: SPACING.sm,
-    },
-    countryRowName: {
-      flex: 1,
-      fontFamily: FONTS.inter,
-      fontSize: 16,
-      fontWeight: FONT_WEIGHTS.regular,
-    },
-    yearSection: {
-      marginTop: SPACING.sm,
-      marginBottom: SPACING.sm,
-    },
-    yearSectionTitle: {
-      fontFamily: FONTS.inter,
-      fontSize: 16,
-      fontWeight: FONT_WEIGHTS.semibold,
-      color: colors.textPrimary,
-      marginBottom: SPACING.sm,
-    },
-    yearPickerWrap: {
-      gap: SPACING.sm,
-    },
-    selectedYearsRow: {
-      flexDirection: 'row',
-      flexWrap: 'wrap',
-      gap: SPACING.sm,
-    },
-    selectedYearPill: {
-      borderWidth: 1,
-      borderRadius: 999,
-      paddingVertical: SPACING.xs,
-      paddingHorizontal: SPACING.md,
-      backgroundColor: colors.surfaceVariant,
-    },
-    selectedYearText: {
-      fontFamily: FONTS.inter,
-      fontSize: 14,
-      fontWeight: FONT_WEIGHTS.semibold,
-    },
-    addYearButton: {
-      minWidth: 34,
-      height: 34,
-      borderRadius: 17,
-      borderWidth: 1,
-      alignItems: 'center',
-      justifyContent: 'center',
-      paddingHorizontal: SPACING.xs,
-    },
-    addYearButtonText: {
-      fontFamily: FONTS.inter,
-      fontSize: 20,
-      fontWeight: FONT_WEIGHTS.semibold,
-      lineHeight: 22,
-    },
-    yearPickerList: {
-      borderWidth: 1,
-      borderRadius: 12,
-      maxHeight: 240,
-      overflow: 'hidden',
-      backgroundColor: colors.background,
-    },
-    yearPickerListScroll: {
-      maxHeight: 240,
-    },
-    yearPickerRow: {
-      minHeight: 46,
-      justifyContent: 'center',
-      paddingHorizontal: SPACING.md,
-      paddingVertical: SPACING.sm,
-    },
-    yearPickerRowBorder: {
-      borderBottomWidth: StyleSheet.hairlineWidth,
-    },
-    yearPickerRowText: {
-      fontFamily: FONTS.inter,
-      fontSize: 15,
-      fontWeight: FONT_WEIGHTS.semibold,
     },
     customDateLabel: {
       fontFamily: FONTS.inter,
@@ -1653,6 +1465,35 @@ function createStyles(colors: ThemeColors, insets: { top: number; bottom: number
       fontSize: 16,
       fontWeight: FONT_WEIGHTS.semibold,
       color: colors.textPrimary,
+    },
+    batchControls: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingHorizontal: SPACING.lg,
+      paddingTop: SPACING.sm,
+      paddingBottom: SPACING.md,
+    },
+    batchSummary: {
+      fontFamily: FONTS.inter,
+      fontSize: 13,
+      flex: 1,
+      marginRight: SPACING.sm,
+    },
+    batchButtons: {
+      flexDirection: 'row',
+      gap: SPACING.xs,
+    },
+    batchBtn: {
+      paddingVertical: 6,
+      paddingHorizontal: 12,
+      borderRadius: 8,
+      borderWidth: 1,
+    },
+    batchBtnText: {
+      fontFamily: FONTS.inter,
+      fontSize: 13,
+      fontWeight: FONT_WEIGHTS.semibold,
     },
   });
 }

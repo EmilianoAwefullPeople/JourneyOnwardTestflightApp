@@ -313,7 +313,7 @@ const SuggestedAlbumsScreen: React.FC = () => {
           endDate: s.endDate,
           locationName: s.country !== 'Unknown' ? s.country : undefined,
         };
-        await createTripAlbum(album);
+        await createTripAlbum(album, 'import');
       }
       navigation.goBack();
     } catch {

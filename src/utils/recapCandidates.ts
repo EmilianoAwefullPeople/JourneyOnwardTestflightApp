@@ -4,6 +4,7 @@
 import { Entry } from '../models/Entry';
 import { TripAlbum } from '../models/TripAlbum';
 import type { RecapCandidate } from '../models/Recap';
+import { isTripFinished } from './albumUtils';
 
 /**
  * Format date range for display (matches TripAlbumsSection).
@@ -49,8 +50,8 @@ function getPreviewUris(entries: Entry[], maxCount: number): string[] {
 }
 
 /**
- * Returns recap-capable candidates: trip albums that have at least one entry.
- * Sorted by end date descending (most recent first); no endDate uses startDate for sort.
+ * Returns recap-capable candidates: trip albums that have finished (see `isTripFinished`) and
+ * have at least one entry. Sorted by end date descending (most recent first).
  * Pure, sync, no I/O.
  */
 export function getRecapCandidates(entries: Entry[], tripAlbums: TripAlbum[]): RecapCandidate[] {
@@ -61,6 +62,7 @@ export function getRecapCandidates(entries: Entry[], tripAlbums: TripAlbum[]): R
   const candidates: RecapCandidate[] = [];
 
   for (const album of tripAlbums) {
+    if (!isTripFinished(album)) continue;
     const albumEntries = entries.filter((e) => e.albumId === album.id && !e.isDraft);
     if (albumEntries.length === 0) continue;
 

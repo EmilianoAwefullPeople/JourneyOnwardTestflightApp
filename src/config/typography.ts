@@ -15,27 +15,6 @@ export interface TypographyStyle extends Omit<TextStyle, 'fontWeight'> {
  * Predefined text styles matching Figma
  */
 export const TEXT_STYLES = {
-  // Opening Screen (Loading Screen)
-  openingTitle: {
-    fontFamily: FONTS.playfairDisplay,
-    fontSize: FONT_SIZES['4xl'],
-    fontWeight: FONT_WEIGHTS.black,
-    color: COLORS.white,
-    textShadowColor: 'rgba(0, 0, 0, 0.25)',
-    textShadowOffset: { width: 0, height: 4 },
-    textShadowRadius: 4,
-  } as TextStyle,
-
-  openingSubtitle: {
-    fontFamily: FONTS.inter,
-    fontSize: FONT_SIZES.md,
-    fontWeight: FONT_WEIGHTS.regular,
-    color: COLORS.white,
-    textShadowColor: 'rgba(0, 0, 0, 0.25)',
-    textShadowOffset: { width: 0, height: 4 },
-    textShadowRadius: 4,
-  } as TextStyle,
-
   // Header
   headerGreeting: {
     fontFamily: FONTS.inter,

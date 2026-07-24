@@ -1,5 +1,5 @@
-import React, { useEffect, useId, useMemo, useState } from 'react';
-import { useNavigation } from '@react-navigation/native';
+import React, { useCallback, useEffect, useId, useMemo, useState } from 'react';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { AppState, Dimensions, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -13,23 +13,28 @@ import { Entry } from '../../models/Entry';
 import { Journal } from '../../models/Journal';
 import { TripAlbum } from '../../models/TripAlbum';
 import { getCityCountryLabel, getCountryFromCoordinates } from '../../utils/dateUtils';
-import { getContinentForCountryName, getCountryFlagEmoji } from '../../utils/countryUtils';
+import { mapWithConcurrency } from '../../utils/concurrency';
+import { getContinentForCountryName, getCountryFlagEmoji, getIsoForCountryName } from '../../utils/countryUtils';
 import { getEffectiveMainTabInset } from '../../navigation/mainTabBarMetrics';
 import { pointsToSmoothAreaPath, pointsToSmoothCurvePath } from '../../utils/chartSmoothPath';
 import { buildCaptureCountryByDayKey, buildMergedDayCountryDisplay } from '../../utils/calendarDayCountryMap';
 import { localDayKeyFromDate, localDayKeysInMonth } from '../../utils/dayKeyUtils';
 import { RootStackParamList } from '../../navigation/types';
-import { getDayCountrySnapshotsForDayKeys } from '../../storage/dayCountrySnapshotStorage';
+import { getDayCountrySnapshotsForDayKeys, setDayCountrySnapshotsBatch } from '../../storage/dayCountrySnapshotStorage';
+import { getCountryCategories, type CountryVisitCategory } from '../../storage/countryCategoryStorage';
 import DashboardDayFlagCalendar from './DashboardDayFlagCalendar';
+import CountryRangeAssignSheet from './CountryRangeAssignSheet';
 import DashboardGeneralKpiStrip from './DashboardGeneralKpiStrip';
 import { useDashboardColorPalette } from '../../hooks/useDashboardColorPalette';
 import DashboardEmotionalDataSection from './DashboardEmotionalDataSection';
+import CountriesVisitedMap from './CountriesVisitedMap';
 
 interface DashboardSectionProps {
   entries: Entry[];
   journals: Journal[];
   tripAlbums: TripAlbum[];
   tripFilterActive?: boolean;
+  isVisible?: boolean;
   scrollRef?: React.RefObject<ScrollView | null>;
   onScrollReport?: (offsetY: number) => void;
   tabBarVisibilityProgress?: number;
@@ -277,6 +282,7 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
   journals,
   tripAlbums,
   tripFilterActive = false,
+  isVisible = true,
   scrollRef,
   onScrollReport,
   tabBarVisibilityProgress = 1,
@@ -330,7 +336,7 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
 
   /** Hero location: current device position (not last entry). Refreshes when app becomes active. */
   useEffect(() => {
-    if (tripFilterActive) return;
+    if (!isVisible || tripFilterActive) return;
     let cancelled = false;
 
     const refreshUserLocation = async () => {
@@ -375,9 +381,10 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
       cancelled = true;
       sub.remove();
     };
-  }, [tripFilterActive]);
+  }, [isVisible, tripFilterActive]);
 
   useEffect(() => {
+    if (!isVisible) return;
     let cancelled = false;
     const coordPairs = new Set<string>();
     [...entries, ...journals].forEach((item) => {
@@ -392,24 +399,25 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
     }
     (async () => {
       const next: Record<string, string> = { ...seededCountryByCoord };
-      for (const coord of limitedCoords) {
-        if (next[coord]) continue;
+      const coordsToResolve = limitedCoords.filter((c) => !next[c]);
+      await mapWithConcurrency(coordsToResolve, 4, async (coord) => {
         try {
           const [lat, lng] = coord.split(',').map(Number);
           const country = await getCountryFromCoordinates(lat, lng);
           if (country) next[coord] = country;
-        } catch (_) {
+        } catch {
           // Soft-fail this coord; keep resolving the rest.
         }
-      }
+      });
       if (!cancelled) setCountryByCoord(next);
     })();
     return () => {
       cancelled = true;
     };
-  }, [entries, journals, seededCountryByCoord]);
+  }, [isVisible, entries, journals, seededCountryByCoord]);
 
   useEffect(() => {
+    if (!isVisible) return;
     if (tripFilterActive) {
       setCalendarSnapshots({});
       return;
@@ -423,17 +431,60 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [calendarAnchor.y, calendarAnchor.m]);
+  }, [isVisible, calendarAnchor.y, calendarAnchor.m, tripFilterActive]);
 
   useEffect(() => {
-    if (tripFilterActive) return;
+    if (!isVisible || tripFilterActive) return;
     const sub = AppState.addEventListener('change', (state) => {
       if (state !== 'active') return;
       const keys = localDayKeysInMonth(calendarAnchor.y, calendarAnchor.m);
       void getDayCountrySnapshotsForDayKeys(keys).then(setCalendarSnapshots);
     });
     return () => sub.remove();
-  }, [calendarAnchor.y, calendarAnchor.m]);
+  }, [isVisible, calendarAnchor.y, calendarAnchor.m, tripFilterActive]);
+
+  /** Re-fetch when returning from DayDetail, in case a country was just recorded there. */
+  useFocusEffect(
+    useCallback(() => {
+      if (tripFilterActive) return;
+      const keys = localDayKeysInMonth(calendarAnchor.y, calendarAnchor.m);
+      void getDayCountrySnapshotsForDayKeys(keys).then(setCalendarSnapshots);
+    }, [calendarAnchor.y, calendarAnchor.m, tripFilterActive])
+  );
+
+  const [countryCategoryOverrides, setCountryCategoryOverrides] = useState<Record<string, CountryVisitCategory>>({});
+
+  /** Re-fetch when returning from the full-screen map, in case categories were just edited there. */
+  useFocusEffect(
+    useCallback(() => {
+      void getCountryCategories().then(setCountryCategoryOverrides);
+    }, [])
+  );
+
+  const handleCalendarDayPress = useCallback(
+    (dayKey: string) => {
+      navigation.navigate('DayDetail', { dayKey });
+    },
+    [navigation]
+  );
+
+  const [rangeSelectDayKeys, setRangeSelectDayKeys] = useState<string[] | null>(null);
+  const handleRangeSelectionEnd = useCallback((dayKeys: string[]) => {
+    if (dayKeys.length < 2) return;
+    setRangeSelectDayKeys(dayKeys);
+  }, []);
+  const handleRangeSelectSave = useCallback(
+    async (country: string) => {
+      const keys = rangeSelectDayKeys ?? [];
+      setRangeSelectDayKeys(null);
+      if (keys.length === 0) return;
+      await setDayCountrySnapshotsBatch(keys, country);
+      const monthKeys = localDayKeysInMonth(calendarAnchor.y, calendarAnchor.m);
+      const snaps = await getDayCountrySnapshotsForDayKeys(monthKeys);
+      setCalendarSnapshots(snaps);
+    },
+    [rangeSelectDayKeys, calendarAnchor.y, calendarAnchor.m]
+  );
 
   const dashboardGeneralKpis = useMemo(() => {
     const uniqueCountries = new Set<string>(Object.values(countryByCoord));
@@ -535,6 +586,25 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
 
   const countryRanking = useMemo(() => allCountryRanking.slice(0, 5), [allCountryRanking]);
 
+  const visitedIsoCodes = useMemo(() => {
+    const codes = new Set<string>();
+    allCountryRanking.forEach((row) => {
+      const iso = getIsoForCountryName(row.country);
+      if (iso) codes.add(iso);
+    });
+    return codes;
+  }, [allCountryRanking]);
+
+  const visitedCountryNames = useMemo(() => allCountryRanking.map((row) => row.country), [allCountryRanking]);
+
+  const countryCategories = useMemo(() => {
+    const map: Record<string, CountryVisitCategory> = {};
+    visitedIsoCodes.forEach((iso) => {
+      map[iso] = countryCategoryOverrides[iso] ?? 'visited';
+    });
+    return map;
+  }, [visitedIsoCodes, countryCategoryOverrides]);
+
   const continentBreakdown = useMemo(() => {
     const continentWeights = new Map<string, number>();
     let attributed = 0;
@@ -631,6 +701,7 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
   const showAltitudeData = chartData.altitude.some((value) => value > 0);
 
   return (
+    <>
     <ScrollView
       ref={scrollRef}
       style={styles.container}
@@ -722,7 +793,48 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
           todayDayKey={todayDayKey}
           todayPillBackground={colors.surfaceVariant}
           todayDayNumberColor={colors.textPrimary}
+          onDayPress={handleCalendarDayPress}
+          onRangeSelectionEnd={handleRangeSelectionEnd}
         />
+      </DashboardCard>
+
+      <DashboardCard
+        title="Countries visited"
+        subtitle={
+          visitedIsoCodes.size > 0
+            ? `${visitedIsoCodes.size} ${visitedIsoCodes.size === 1 ? 'country' : 'countries'}`
+            : undefined
+        }
+        titleRight={
+          visitedIsoCodes.size > 0 ? (
+            <Pressable
+              onPress={() =>
+                navigation.navigate('CountriesVisitedMapFull', {
+                  visitedIsoCodes: Array.from(visitedIsoCodes),
+                  countryNames: visitedCountryNames,
+                })
+              }
+              hitSlop={8}
+              accessibilityRole="button"
+              accessibilityLabel="Expand map"
+            >
+              <Text style={[styles.calendarOpenLink, { color: colors.textTertiary }]} maxFontSizeMultiplier={1.25}>
+                Expand map
+              </Text>
+            </Pressable>
+          ) : undefined
+        }
+      >
+        {visitedIsoCodes.size > 0 ? (
+          <CountriesVisitedMap
+            categories={countryCategories}
+            countryNames={visitedCountryNames}
+            width={chartWidth}
+            colors={colors}
+          />
+        ) : (
+          <Text style={[styles.placeholderText, { color: colors.textSecondary }]}>Need more geocoded country data.</Text>
+        )}
       </DashboardCard>
 
       <DashboardCard title="Continents">
@@ -823,12 +935,6 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
         )}
       </DashboardCard>
 
-      <DashboardCard title="Place type ranking" subtitle="Coming soon">
-        <Text style={[styles.placeholderText, { color: colors.textSecondary }]}>
-          Place categories: city, beach, forest, desert, etc.
-        </Text>
-      </DashboardCard>
-
       <DashboardCard title="Altitude over time">
         {showAltitudeData ? (
           <SimpleLineChart
@@ -884,6 +990,13 @@ const DashboardSection: React.FC<DashboardSectionProps> = ({
       </DashboardCard>
 
     </ScrollView>
+    <CountryRangeAssignSheet
+      visible={rangeSelectDayKeys != null}
+      dayCount={rangeSelectDayKeys?.length ?? 0}
+      onCancel={() => setRangeSelectDayKeys(null)}
+      onSave={handleRangeSelectSave}
+    />
+    </>
   );
 };
 

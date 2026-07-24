@@ -62,13 +62,13 @@ const EntryEditScreen: React.FC = () => {
 
   const [emotionLabels, setEmotionLabels] = useState<string[]>([]);
   const [emotionNote, setEmotionNote] = useState('');
-  const [isAwe, setIsAwe] = useState(false);
+  const [isBookmarked, setIsBookmarked] = useState(false);
 
   useEffect(() => {
     if (!entry) return;
     setEmotionLabels(entry.emotionLabels ?? []);
     setEmotionNote(entry.emotionNote ?? '');
-    setIsAwe(entry.isAwe ?? false);
+    setIsBookmarked(entry.isBookmarked ?? false);
   }, [entry]);
 
   // Reset one-time focus-field handling when editing a different entry.
@@ -115,9 +115,9 @@ const EntryEditScreen: React.FC = () => {
 
   const handleBookmarkToggle = () => {
     if (!entry) return;
-    const next = !isAwe;
-    setIsAwe(next);
-    updateEntry({ ...entry, isAwe: next })
+    const next = !isBookmarked;
+    setIsBookmarked(next);
+    updateEntry({ ...entry, isBookmarked: next })
       .catch(err => logger.error('EntryEdit: updateEntry (bookmark) failed', err));
   };
 
@@ -136,7 +136,7 @@ const EntryEditScreen: React.FC = () => {
     );
   }
 
-  const liveEntry = { ...entry, isAwe };
+  const liveEntry = { ...entry, isBookmarked };
 
   return (
     <View style={[styles.container, { paddingTop: safeTop }]}>
@@ -198,15 +198,15 @@ const EntryEditScreen: React.FC = () => {
           style={[
             styles.bookmarkButton,
             { marginBottom: safeBottom + SPACING.lg },
-            isAwe && styles.bookmarkButtonActive,
+            isBookmarked && styles.bookmarkButtonActive,
           ]}
           onPress={handleBookmarkToggle}
           activeOpacity={0.7}
           accessibilityRole="button"
-          accessibilityLabel={isAwe ? 'Remove bookmark' : 'Bookmark this experience'}
-          accessibilityState={{ selected: isAwe }}
+          accessibilityLabel={isBookmarked ? 'Remove bookmark' : 'Bookmark this experience'}
+          accessibilityState={{ selected: isBookmarked }}
         >
-          {isAwe && (
+          {isBookmarked && (
             <LinearGradient
               colors={[COLORS.babyBlue, COLORS.royalGold, COLORS.fern]}
               start={{ x: 0, y: 0 }}

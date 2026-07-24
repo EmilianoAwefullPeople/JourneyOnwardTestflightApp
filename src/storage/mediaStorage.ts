@@ -2,9 +2,11 @@
 // Copies media files into the app's persistent document directory so they survive app updates.
 
 import { File, Directory, Paths } from 'expo-file-system';
+import { copyAsync } from 'expo-file-system/legacy';
 import { logger } from '../utils/logger';
 
 export const MEDIA_DIR_NAME = 'media';
+const POSTCARD_THUMB_DIR_NAME = 'postcard_thumbs';
 
 /**
  * Resolves a stored photo path to a fully-qualified `file://` URI suitable for
@@ -89,36 +91,37 @@ export async function copyMediaToPersistentStorage(
   sourceUris: string[],
   entryId: string
 ): Promise<string[]> {
-  if (sourceUris.length === 0) {
-    return [];
-  }
+  if (sourceUris.length === 0) return [];
 
   ensureMediaDirectory();
   const mediaDir = new Directory(Paths.document, MEDIA_DIR_NAME);
-  const resultUris: string[] = [];
 
-  for (let i = 0; i < sourceUris.length; i++) {
-    const sourceUri = sourceUris[i];
-    const ext = getExtensionFromUri(sourceUri);
-    const destFileName = `${entryId}_${i}${ext}`;
-    const destFile = new File(mediaDir, destFileName);
-
-    try {
-      const sourceFile = new File(sourceUri);
-      if (!sourceFile.exists) {
-        throw new Error(`Source file does not exist: ${sourceUri}`);
-      }
-      sourceFile.copy(destFile);
-      // Store relative path so the URI stays valid regardless of container path changes
-      resultUris.push(`${MEDIA_DIR_NAME}/${destFileName}`);
-    } catch (error) {
-      logger.error('mediaStorage: copy failed', { sourceUri, destFileName, entryId, error });
-      throw error;
+  // Validate all sources exist before starting any copy.
+  for (const uri of sourceUris) {
+    if (!new File(uri).exists) {
+      throw new Error(`Source file does not exist: ${uri}`);
     }
   }
 
-  logger.log(`mediaStorage: copied ${resultUris.length} file(s) for entry ${entryId}`);
-  return resultUris;
+  // copyAsync runs on the native background thread, so all copies run in parallel
+  // without blocking the JS thread. Order is preserved via index mapping.
+  const relativePaths = await Promise.all(
+    sourceUris.map(async (sourceUri, i) => {
+      const ext = getExtensionFromUri(sourceUri);
+      const destFileName = `${entryId}_${i}${ext}`;
+      const destFile = new File(mediaDir, destFileName);
+      try {
+        await copyAsync({ from: sourceUri, to: destFile.uri });
+        return `${MEDIA_DIR_NAME}/${destFileName}`;
+      } catch (error) {
+        logger.error('mediaStorage: copy failed', { sourceUri, destFileName, entryId, error });
+        throw error;
+      }
+    })
+  );
+
+  logger.log(`mediaStorage: copied ${relativePaths.length} file(s) for entry ${entryId}`);
+  return relativePaths;
 }
 
 /**
@@ -141,9 +144,8 @@ export async function copyMediaSlotToPersistentStorage(
     if (!sourceFile.exists) {
       throw new Error(`Source file does not exist: ${sourceUri}`);
     }
-    sourceFile.copy(destFile);
+    await copyAsync({ from: sourceUri, to: destFile.uri });
     logger.log(`mediaStorage: copied slot ${slotIndex} for entry ${entryId}`);
-    // Return relative path for stable storage
     return `${MEDIA_DIR_NAME}/${destFileName}`;
   } catch (error) {
     logger.error('mediaStorage: slot copy failed', { sourceUri, destFileName, entryId, slotIndex, error });
@@ -154,7 +156,7 @@ export async function copyMediaSlotToPersistentStorage(
 /**
  * Deletes files in documentDirectory/media named `{entryId}_*`. Best-effort after DB row removal.
  */
-/** Removes documentDirectory/media (all entry media). Used with full DB reset. */
+/** Removes documentDirectory/media (all entry media) and cached postcard thumbnails. Used with full DB reset. */
 export function deleteAllPersistentMedia(): void {
   try {
     const mediaDir = new Directory(Paths.document, MEDIA_DIR_NAME);
@@ -163,6 +165,14 @@ export function deleteAllPersistentMedia(): void {
     }
   } catch (e) {
     logger.warn('mediaStorage: deleteAllPersistentMedia failed', e);
+  }
+  try {
+    const thumbDir = new Directory(Paths.document, POSTCARD_THUMB_DIR_NAME);
+    if (thumbDir.exists) {
+      thumbDir.delete();
+    }
+  } catch (e) {
+    logger.warn('mediaStorage: deleteAllPersistentMedia (postcard thumbs) failed', e);
   }
 }
 
@@ -229,9 +239,7 @@ export async function generateAndSaveThumbnails(
         [{ resize: { width: 600 } }],
         { compress: 0.82, format: SaveFormat.JPEG },
       );
-      // Copy from manipulator's temp output to persistent media directory.
-      const tempFile = new File(thumb.uri);
-      tempFile.copy(thumbFile);
+      await copyAsync({ from: thumb.uri, to: thumbFile.uri });
       result.push(thumbRelativePath);
     } catch (e) {
       logger.warn('mediaStorage: thumbnail generation failed', { entryId, index: i, error: e });
@@ -240,4 +248,78 @@ export async function generateAndSaveThumbnails(
   }
 
   return result;
+}
+
+const POSTCARD_THUMB_WIDTH = 600;
+
+function ensurePostcardThumbDirectory(): Directory {
+  const dir = new Directory(Paths.document, POSTCARD_THUMB_DIR_NAME);
+  if (!dir.exists) {
+    dir.create({ intermediates: true, idempotent: true });
+  }
+  return dir;
+}
+
+/**
+ * Generates (and caches on disk) a 600px-wide JPEG copy of each postcard photo slot, so
+ * gallery/list thumbnails don't decode full-resolution originals — postcard photos are
+ * referenced by their original source URI (entry photo or camera-roll asset), which can be
+ * several megabytes each. Skips slots that already have a cached copy; falls back to the
+ * original URI for any slot that fails to resize (e.g. unsupported `ph://` variant).
+ *
+ * @param postcardId - Postcard UUID used to name/cache the thumbnail files.
+ * @param sourcePaths - Slot photo URIs in slot order; nulls pass through unchanged.
+ */
+export async function getOrCreatePostcardPhotoThumbnails(
+  postcardId: string,
+  sourcePaths: (string | null)[],
+): Promise<(string | null)[]> {
+  if (sourcePaths.every((p) => !p)) return sourcePaths;
+
+  // Dynamic import so expo-image-manipulator isn't in the initial module chain.
+  const { manipulateAsync, SaveFormat } = await import('expo-image-manipulator');
+
+  const thumbDir = ensurePostcardThumbDirectory();
+
+  return Promise.all(
+    sourcePaths.map(async (sourcePath, i) => {
+      if (!sourcePath) return null;
+
+      const thumbFile = new File(thumbDir, `${postcardId}_${i}_thumb.jpg`);
+      if (thumbFile.exists) return thumbFile.uri;
+
+      try {
+        const thumb = await manipulateAsync(
+          sourcePath,
+          [{ resize: { width: POSTCARD_THUMB_WIDTH } }],
+          { compress: 0.82, format: SaveFormat.JPEG },
+        );
+        await copyAsync({ from: thumb.uri, to: thumbFile.uri });
+        return thumbFile.uri;
+      } catch (e) {
+        logger.warn('mediaStorage: postcard thumbnail generation failed', { postcardId, index: i, error: e });
+        return sourcePath;
+      }
+    })
+  );
+}
+
+/** Deletes cached postcard thumbnail files for a postcard. Best-effort after DB row removal. */
+export function deletePostcardPhotoThumbnails(postcardId: string): void {
+  try {
+    const thumbDir = new Directory(Paths.document, POSTCARD_THUMB_DIR_NAME);
+    if (!thumbDir.exists) return;
+    const prefix = `${postcardId}_`;
+    for (const item of thumbDir.list()) {
+      if (!(item instanceof File)) continue;
+      if (!item.name.startsWith(prefix)) continue;
+      try {
+        item.delete();
+      } catch (err) {
+        logger.warn('mediaStorage: delete postcard thumbnail failed', { name: item.name, postcardId, err });
+      }
+    }
+  } catch (e) {
+    logger.warn('mediaStorage: deletePostcardPhotoThumbnails failed', { postcardId, e });
+  }
 }

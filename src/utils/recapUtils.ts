@@ -1,5 +1,6 @@
 import { Entry } from '../models/Entry';
 import { Journal } from '../models/Journal';
+import { aggregatePalette } from './paletteAggregation';
 
 export interface LocationPin {
   latitude: number;
@@ -58,9 +59,9 @@ export function selectFromPeriod(
 
   if (pool.length === 0) pool = withPhotos;
 
-  const awe = pool.filter((e) => e.isAwe === true);
-  const rest = pool.filter((e) => !e.isAwe);
-  const sorted = [...awe, ...rest];
+  const bookmarked = pool.filter((e) => e.isBookmarked === true);
+  const rest = pool.filter((e) => !e.isBookmarked);
+  const sorted = [...bookmarked, ...rest];
 
   return sorted.slice(0, count);
 }
@@ -76,40 +77,9 @@ const FALLBACK_PALETTE_COLORS = [
   '#C4A882',
 ];
 
-function hexDistance(a: string, b: string): number {
-  const parse = (h: string) => {
-    const c = h.replace('#', '');
-    return [
-      parseInt(c.slice(0, 2), 16),
-      parseInt(c.slice(2, 4), 16),
-      parseInt(c.slice(4, 6), 16),
-    ];
-  };
-  const [r1, g1, b1] = parse(a);
-  const [r2, g2, b2] = parse(b);
-  return Math.sqrt((r1 - r2) ** 2 + (g1 - g2) ** 2 + (b1 - b2) ** 2);
-}
-
 export function extractTripColors(entries: Entry[]): string[] {
-  const all: string[] = [];
-  for (const entry of entries) {
-    if (entry.colorPalettes) {
-      for (const palette of entry.colorPalettes) {
-        if (palette?.[0]) all.push(palette[0]);
-      }
-    }
-  }
-
-  if (all.length < 3) return FALLBACK_PALETTE_COLORS.slice(0, 6);
-
-  const deduped: string[] = [];
-  for (const color of all) {
-    const tooClose = deduped.some((c) => hexDistance(c, color) < 30);
-    if (!tooClose) deduped.push(color);
-    if (deduped.length >= 8) break;
-  }
-
-  return deduped.length >= 3 ? deduped : FALLBACK_PALETTE_COLORS.slice(0, 6);
+  const aggregated = aggregatePalette(entries, 8);
+  return aggregated.length >= 3 ? aggregated : FALLBACK_PALETTE_COLORS.slice(0, 6);
 }
 
 export function getDistinctLocations(entries: Entry[]): LocationPin[] {
@@ -225,7 +195,7 @@ export function selectJournalForQuote(
 }
 
 export function selectBookmarkedPhotoEntry(entries: Entry[]): Entry | null {
-  const candidates = entries.filter((e) => e.isAwe === true && getPhotoUri(e) !== null);
+  const candidates = entries.filter((e) => e.isBookmarked === true && getPhotoUri(e) !== null);
   return candidates[0] ?? null;
 }
 
@@ -275,7 +245,7 @@ export function selectFromPercentile(
   startPct: number,
   endPct: number,
   count: number,
-  prioritizeAwe: boolean
+  prioritizeBookmarks: boolean
 ): Entry[] {
   const withPhotos = getEntriesWithPhotos(sortedEntries);
   if (withPhotos.length === 0) return [];
@@ -286,10 +256,10 @@ export function selectFromPercentile(
   let pool = withPhotos.slice(start, Math.max(end, start + 1));
   if (pool.length === 0) pool = withPhotos;
 
-  if (prioritizeAwe) {
-    const awe = pool.filter((e) => e.isAwe === true);
-    const rest = pool.filter((e) => !e.isAwe);
-    pool = [...awe, ...rest];
+  if (prioritizeBookmarks) {
+    const bookmarked = pool.filter((e) => e.isBookmarked === true);
+    const rest = pool.filter((e) => !e.isBookmarked);
+    pool = [...bookmarked, ...rest];
   }
 
   return pool.slice(0, count);

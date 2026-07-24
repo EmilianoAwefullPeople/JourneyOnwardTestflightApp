@@ -31,6 +31,14 @@ export async function setDayCountrySnapshot(dayKey: string, country: string): Pr
   await AsyncStorage.setItem(storageKey(dayKey), JSON.stringify(payload));
 }
 
+/** Assign the same country to multiple days in one write (e.g. drag range-select). */
+export async function setDayCountrySnapshotsBatch(dayKeys: string[], country: string): Promise<void> {
+  if (dayKeys.length === 0) return;
+  const savedAt = new Date().toISOString();
+  const payload = JSON.stringify({ country, savedAt } satisfies DayCountrySnapshot);
+  await AsyncStorage.multiSet(dayKeys.map((dayKey) => [storageKey(dayKey), payload]));
+}
+
 /** Load snapshots for inclusive dayKey range (lexicographic works for Y-M-D with fixed-width... our keys are not zero-padded - careful). */
 export async function getDayCountrySnapshotsForDayKeys(dayKeys: string[]): Promise<Record<string, string>> {
   if (dayKeys.length === 0) return {};

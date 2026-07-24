@@ -91,7 +91,7 @@ export function buildRecapSlides(
 
   // ── ACT I ──────────────────────────────────────────────────────────────────
 
-  // opening_screen — up to 6 photos, isAwe-prioritized, whole trip
+  // opening_screen — up to 6 photos, bookmark-prioritized, whole trip
   const openingPool = selectFromPercentile(nonDraft, 0, 1, 6, true);
   if (openingPool.length > 0) {
     push('opening_screen', openingPool.length * 1000, {
@@ -216,8 +216,8 @@ export function buildRecapSlides(
     } as MiddlePhotosPayload);
   }
 
-  // weather_data — ≥2 distinct weather conditions
-  if (weatherAgg.length >= 2) {
+  // weather_data — ≥1 distinct weather condition
+  if (weatherAgg.length >= 1) {
     // Pick photo from the most-frequent weather condition
     const topCondition = weatherAgg[0].condition;
     const photoEntry =
@@ -262,7 +262,7 @@ export function buildRecapSlides(
 
   // ── ACT III ────────────────────────────────────────────────────────────────
 
-  // end_of_trip_photos — last 30%, up to 6, isAwe-prioritized
+  // end_of_trip_photos — last 30%, up to 6, bookmark-prioritized
   let endPool = selectFromPercentile(nonDraft, 0.70, 1.0, 6, true);
   if (endPool.length === 0) endPool = withPhotos.slice(-3); // fallback
   if (endPool.length > 0) {

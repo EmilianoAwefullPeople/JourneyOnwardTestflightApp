@@ -20,6 +20,9 @@ export interface TemplateBaseProps {
   previewMode?: boolean;
   /** Scales fixed internal dimensions (padding, fonts, borders) for thumbnail rendering. */
   scale?: number;
+  /** Full in-memory entries list, for templates that need more than just their own slots
+   *  (e.g. the Month Calendar template building a day-by-day country map for a chosen month). */
+  allEntries?: Entry[];
 }
 
 // ---------------------------------------------------------------------------

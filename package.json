@@ -24,6 +24,7 @@
     "@react-navigation/native": "^7.1.28",
     "@react-navigation/native-stack": "^7.10.0",
     "@shopify/flash-list": "2.0.2",
+    "@supabase/supabase-js": "^2.108.2",
     "@types/pako": "^2.0.4",
     "expo": "~54.0.33",
     "expo-audio": "~1.1.1",
@@ -54,7 +55,10 @@
   },
   "devDependencies": {
     "@types/react": "~19.1.0",
-    "typescript": "~5.9.2"
+    "i18n-iso-countries": "^7.14.0",
+    "topojson-client": "^3.1.0",
+    "typescript": "~5.9.2",
+    "world-atlas": "^2.0.2"
   },
   "private": true
 }

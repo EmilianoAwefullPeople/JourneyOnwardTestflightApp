@@ -3,6 +3,7 @@
 // This prevents "expected dynamic type 'boolean', but had type 'string'" errors
 
 import React, { useState, useEffect } from 'react';
+import { View } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -11,8 +12,12 @@ import { PermanentMarker_400Regular } from '@expo-google-fonts/permanent-marker'
 import { Caveat_400Regular } from '@expo-google-fonts/caveat';
 import { AppProvider } from './src/context/AppContext';
 import { ThemeProvider, useTheme } from './src/context/ThemeContext';
-import LoadingScreen from './src/screens/LoadingScreen';
+import { COLORS } from './src/config/constants';
 import DailyAppOpenCountryCapture from './src/components/DailyAppOpenCountryCapture';
+
+const BootstrapPlaceholder = () => (
+  <View style={{ flex: 1, backgroundColor: COLORS.splashBackground }} />
+);
 
 // DO NOT import AppNavigator at top level - lazy-load it instead
 // This prevents native module registration during app startup
@@ -33,7 +38,7 @@ const AppContent: React.FC = () => {
     return (
       <>
         <StatusBarWrapper />
-        <LoadingScreen />
+        <BootstrapPlaceholder />
       </>
     );
   }
@@ -59,7 +64,7 @@ export default function App() {
     Caveat_400Regular,
   });
 
-  // Show LoadingScreen until fonts are ready or failed — never hang.
+  // Hold bootstrap UI until fonts are ready or failed — never hang.
   const fontsReady = fontsLoaded || fontError !== null;
 
   return (
@@ -67,7 +72,7 @@ export default function App() {
       <AppProvider>
         <ThemeProvider>
           <SafeAreaProvider>
-            {fontsReady ? <AppContent /> : <LoadingScreen />}
+            {fontsReady ? <AppContent /> : <BootstrapPlaceholder />}
           </SafeAreaProvider>
         </ThemeProvider>
       </AppProvider>

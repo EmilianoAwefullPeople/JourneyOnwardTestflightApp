@@ -1,12 +1,13 @@
 // Full-screen month list for dashboard country calendar (all memories; not trip-filtered).
 
-import React, { useEffect, useMemo, useState } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, useWindowDimensions } from 'react-native';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, useWindowDimensions, type LayoutChangeEvent } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import BackArrow from '../components/common/icons/BackArrow';
 import DashboardDayFlagCalendar from '../components/review/DashboardDayFlagCalendar';
+import CountryRangeAssignSheet from '../components/review/CountryRangeAssignSheet';
 import { FONT_WEIGHTS, SPACING } from '../config/constants';
 import { TEXT_STYLES } from '../config/typography';
 import { useTheme } from '../context/ThemeContext';
@@ -15,7 +16,7 @@ import type { RootStackParamList } from '../navigation/types';
 import { getCountryFromCoordinates } from '../utils/dateUtils';
 import { localDayKeyFromDate, localDayKeysInMonth } from '../utils/dayKeyUtils';
 import { buildCaptureCountryByDayKey, buildMergedDayCountryDisplay } from '../utils/calendarDayCountryMap';
-import { getDayCountrySnapshotsForDayKeys } from '../storage/dayCountrySnapshotStorage';
+import { getDayCountrySnapshotsForDayKeys, setDayCountrySnapshotsBatch } from '../storage/dayCountrySnapshotStorage';
 import {
   computeFullCalendarStartMonth,
   currentYearMonth,
@@ -53,6 +54,15 @@ const FullCountryCalendarScreen: React.FC = () => {
 
   const innerWidth = screenWidth - SPACING.md * 2 - SPACING.lg * 2;
   const todayDayKey = useMemo(() => localDayKeyFromDate(new Date()), []);
+
+  // Default the scroll position to the current month (months render oldest -> newest).
+  const scrollRef = useRef<ScrollView>(null);
+  const monthLayoutYRef = useRef<Record<string, number>>({});
+  const scrolledToCurrentRef = useRef(false);
+  const currentMonthKey = useMemo(() => {
+    const now = currentYearMonth();
+    return `${now.year}-${now.monthIndex0}`;
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -110,6 +120,52 @@ const FullCountryCalendarScreen: React.FC = () => {
     [entries, journals, countryByCoord]
   );
 
+  /** Re-fetch snapshots when returning from DayDetail, in case a country was just recorded there. */
+  useFocusEffect(
+    useCallback(() => {
+      if (monthRange.length === 0) return;
+      const allDayKeys = monthRange.flatMap((m) => localDayKeysInMonth(m.year, m.monthIndex0));
+      void getDayCountrySnapshotsForDayKeys(allDayKeys).then(setCalendarSnapshots);
+    }, [monthRange])
+  );
+
+  const handleDayPress = useCallback(
+    (dayKey: string) => {
+      navigation.navigate('DayDetail', { dayKey });
+    },
+    [navigation]
+  );
+
+  const [rangeSelectDayKeys, setRangeSelectDayKeys] = useState<string[] | null>(null);
+  const handleRangeSelectionEnd = useCallback((dayKeys: string[]) => {
+    if (dayKeys.length < 2) return;
+    setRangeSelectDayKeys(dayKeys);
+  }, []);
+  const handleRangeSelectSave = useCallback(
+    async (country: string) => {
+      const keys = rangeSelectDayKeys ?? [];
+      setRangeSelectDayKeys(null);
+      if (keys.length === 0 || monthRange.length === 0) return;
+      await setDayCountrySnapshotsBatch(keys, country);
+      const allDayKeys = monthRange.flatMap((m) => localDayKeysInMonth(m.year, m.monthIndex0));
+      const snaps = await getDayCountrySnapshotsForDayKeys(allDayKeys);
+      setCalendarSnapshots(snaps);
+    },
+    [rangeSelectDayKeys, monthRange]
+  );
+
+  const handleMonthLayout = useCallback(
+    (monthKey: string) => (e: LayoutChangeEvent) => {
+      const y = e.nativeEvent.layout.y;
+      monthLayoutYRef.current[monthKey] = y;
+      if (monthKey === currentMonthKey && !scrolledToCurrentRef.current) {
+        scrolledToCurrentRef.current = true;
+        scrollRef.current?.scrollTo({ y: Math.max(0, y - SPACING.md), animated: false });
+      }
+    },
+    [currentMonthKey]
+  );
+
   return (
     <View style={[styles.root, { backgroundColor: colors.background, paddingTop: insets.top }]}>
       <View style={[styles.header, { borderBottomColor: colors.border }]}>
@@ -129,6 +185,7 @@ const FullCountryCalendarScreen: React.FC = () => {
       </View>
 
       <ScrollView
+        ref={scrollRef}
         style={styles.scroll}
         contentContainerStyle={{
           paddingHorizontal: SPACING.md,
@@ -138,10 +195,11 @@ const FullCountryCalendarScreen: React.FC = () => {
         showsVerticalScrollIndicator={false}
       >
         {monthRange.map((ym) => {
+          const monthKey = `${ym.year}-${ym.monthIndex0}`;
           const keys = localDayKeysInMonth(ym.year, ym.monthIndex0);
           const merged = buildMergedDayCountryDisplay(keys, captureCountryByDay, calendarSnapshots);
           return (
-            <View key={`${ym.year}-${ym.monthIndex0}`} style={{ marginBottom: SPACING.lg }}>
+            <View key={monthKey} style={{ marginBottom: SPACING.lg }} onLayout={handleMonthLayout(monthKey)}>
               <DashboardDayFlagCalendar
                 width={innerWidth}
                 year={ym.year}
@@ -153,11 +211,20 @@ const FullCountryCalendarScreen: React.FC = () => {
                 todayDayKey={todayDayKey}
                 todayPillBackground={colors.surfaceVariant}
                 todayDayNumberColor={colors.textPrimary}
+                onDayPress={handleDayPress}
+                onRangeSelectionEnd={handleRangeSelectionEnd}
               />
             </View>
           );
         })}
       </ScrollView>
+
+      <CountryRangeAssignSheet
+        visible={rangeSelectDayKeys != null}
+        dayCount={rangeSelectDayKeys?.length ?? 0}
+        onCancel={() => setRangeSelectDayKeys(null)}
+        onSave={handleRangeSelectSave}
+      />
     </View>
   );
 };

@@ -2,11 +2,16 @@ import React, { createContext, useCallback, useContext, useMemo, useRef, useStat
 import { Dimensions } from 'react-native';
 import { useRoute } from '@react-navigation/native';
 
+export type ReportScrollOptions = {
+  hideThresholdPx?: number;
+  showThresholdPx?: number;
+};
+
 type MainTabBarVisibilityContextValue = {
   hidden: boolean;
   visibilityProgress: number;
   setActiveRouteKey: (routeKey: string) => void;
-  reportScrollOffset: (routeKey: string, offsetY: number) => void;
+  reportScrollOffset: (routeKey: string, offsetY: number, options?: ReportScrollOptions) => void;
 };
 
 const MainTabBarVisibilityContext = createContext<MainTabBarVisibilityContextValue | null>(null);
@@ -32,9 +37,11 @@ export const MainTabBarVisibilityProvider: React.FC<{ children: React.ReactNode 
     lastOffsetYByRouteRef.current[routeKey] = 0;
   }, []);
 
-  const reportScrollOffset = useCallback((routeKey: string, rawOffsetY: number) => {
+  const reportScrollOffset = useCallback((routeKey: string, rawOffsetY: number, options?: ReportScrollOptions) => {
     if (routeKey !== activeRouteKeyRef.current) return;
 
+    const hideThresholdPx = options?.hideThresholdPx ?? HIDE_THRESHOLD_PX;
+    const showThresholdPx = options?.showThresholdPx ?? SHOW_THRESHOLD_PX;
     const offsetY = Math.max(0, Number.isFinite(rawOffsetY) ? rawOffsetY : 0);
     const prevOffset = lastOffsetYByRouteRef.current[routeKey] ?? offsetY;
     const delta = offsetY - prevOffset;
@@ -54,7 +61,7 @@ export const MainTabBarVisibilityProvider: React.FC<{ children: React.ReactNode 
     if (delta > 0) {
       downDistanceByRouteRef.current[routeKey] = (downDistanceByRouteRef.current[routeKey] ?? 0) + delta;
       upDistanceByRouteRef.current[routeKey] = 0;
-      if (!hidden && downDistanceByRouteRef.current[routeKey] >= HIDE_THRESHOLD_PX) {
+      if (!hidden && downDistanceByRouteRef.current[routeKey] >= hideThresholdPx) {
         setHidden(true);
         downDistanceByRouteRef.current[routeKey] = 0;
       }
@@ -64,7 +71,7 @@ export const MainTabBarVisibilityProvider: React.FC<{ children: React.ReactNode 
     if (delta < 0) {
       upDistanceByRouteRef.current[routeKey] = (upDistanceByRouteRef.current[routeKey] ?? 0) + Math.abs(delta);
       downDistanceByRouteRef.current[routeKey] = 0;
-      if (hidden && upDistanceByRouteRef.current[routeKey] >= SHOW_THRESHOLD_PX) {
+      if (hidden && upDistanceByRouteRef.current[routeKey] >= showThresholdPx) {
         setHidden(false);
         upDistanceByRouteRef.current[routeKey] = 0;
       }
@@ -96,8 +103,8 @@ export const useMainTabBarVisibility = () => {
     throw new Error('useMainTabBarVisibility must be used within MainTabBarVisibilityProvider');
   }
 
-  const reportScrollOffset = useCallback((offsetY: number) => {
-    context.reportScrollOffset(route.key, offsetY);
+  const reportScrollOffset = useCallback((offsetY: number, options?: ReportScrollOptions) => {
+    context.reportScrollOffset(route.key, offsetY, options);
   }, [context, route.key]);
 
   return {

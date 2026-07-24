@@ -111,9 +111,11 @@ function djb2Hash(str: string): string {
  * Returns the string 'empty' when no entries have palette data yet.
  */
 export function computePaletteContentHash(entries: Entry[]): string {
+  // Use updatedAt + palette count as fingerprint — O(N) vs O(N × palette_size) from JSON.stringify.
+  // updatedAt is bumped whenever palette data changes, so this detects all real mutations.
   const parts = entries
     .filter(e => e.colorPalettes != null && e.colorPalettes.length > 0)
-    .map(e => `${e.id}:${JSON.stringify(e.colorPalettes)}`)
+    .map(e => `${e.id}:${e.updatedAt}:${e.colorPalettes!.length}`)
     .sort();
 
   if (parts.length === 0) return 'empty';

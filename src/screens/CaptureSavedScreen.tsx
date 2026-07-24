@@ -61,10 +61,9 @@ const CaptureSavedScreen: React.FC = () => {
         mediaType: 'photo' as const,
         photoPaths: [previewFirstPhotoUri],
         mediaPaths: [previewFirstPhotoUri],
-        storageUrls: [],
         timestamp: now,
         isDraft: false,
-        isAwe: false,
+        isBookmarked: false,
       };
     }
     return null;
@@ -72,7 +71,7 @@ const CaptureSavedScreen: React.FC = () => {
 
   const [emotionLabels, setEmotionLabels] = useState<string[]>([]);
   const [emotionNote, setEmotionNote] = useState('');
-  const [isAwe, setIsAwe] = useState(false);
+  const [isBookmarked, setIsBookmarked] = useState(false);
 
   const styles = useMemo(() => createStyles(colors), [colors]);
   const { width: windowWidth } = useWindowDimensions();
@@ -87,7 +86,7 @@ const CaptureSavedScreen: React.FC = () => {
     if (!entry) return;
     setEmotionLabels(entry.emotionLabels ?? []);
     setEmotionNote(entry.emotionNote ?? '');
-    setIsAwe(entry.isAwe ?? false);
+    setIsBookmarked(entry.isBookmarked ?? false);
   }, [entry]);
 
   // ─── Emotion return handoff ────────────────────────────────────────────────
@@ -113,9 +112,9 @@ const CaptureSavedScreen: React.FC = () => {
 
   const handleBookmarkToggle = () => {
     if (!entry) return;
-    const next = !isAwe;
-    setIsAwe(next);
-    updateEntry({ ...entry, isAwe: next })
+    const next = !isBookmarked;
+    setIsBookmarked(next);
+    updateEntry({ ...entry, isBookmarked: next })
       .catch(err => logger.error('CaptureSaved: updateEntry (bookmark) failed', err));
   };
 
@@ -141,7 +140,7 @@ const CaptureSavedScreen: React.FC = () => {
     );
   }
 
-  const liveEntry = { ...displayEntry, isAwe };
+  const liveEntry = { ...displayEntry, isBookmarked };
 
   return (
     <View style={[styles.container, { paddingTop: safeTop }]}>
@@ -211,17 +210,17 @@ const CaptureSavedScreen: React.FC = () => {
           style={[
             styles.bookmarkButton,
             { marginBottom: safeBottom + SPACING.lg },
-            isAwe && styles.bookmarkButtonActive,
+            isBookmarked && styles.bookmarkButtonActive,
             !entry && styles.actionButtonDisabled,
           ]}
           onPress={handleBookmarkToggle}
           disabled={!entry}
           activeOpacity={0.7}
           accessibilityRole="button"
-          accessibilityLabel={isAwe ? 'Remove bookmark' : 'Bookmark this experience'}
-          accessibilityState={{ selected: isAwe }}
+          accessibilityLabel={isBookmarked ? 'Remove bookmark' : 'Bookmark this experience'}
+          accessibilityState={{ selected: isBookmarked }}
         >
-          {isAwe && (
+          {isBookmarked && (
             <LinearGradient
               colors={[COLORS.babyBlue, COLORS.royalGold, COLORS.fern]}
               start={{ x: 0, y: 0 }}

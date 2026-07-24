@@ -349,13 +349,13 @@ const StatsSection: React.FC<StatsSectionProps> = ({
         uniqueLocations.add(`${j.latitude.toFixed(2)},${j.longitude.toFixed(2)}`);
       }
     });
-    const aweCount = eList.filter((e) => e.isAwe === true).length;
+    const bookmarkCount = eList.filter((e) => e.isBookmarked === true).length;
     return {
       totalEntries: eList.length,
       totalJournals: jList.length,
       totalAlbums: aList.length,
       locationsCount: uniqueLocations.size,
-      aweCount,
+      bookmarkCount,
     };
   }, [filteredEntries, filteredJournals, filteredAlbums]);
 
@@ -531,9 +531,9 @@ const StatsSection: React.FC<StatsSectionProps> = ({
       { emoji: '📷', label: 'Experiences', value: stats.totalEntries, useGradient: true, subtitle: undefined },
       { emoji: '📔', label: 'Journals', value: stats.totalJournals, useGradient: false, subtitle: undefined },
       { emoji: '🗂', label: 'Albums', value: stats.totalAlbums, useGradient: false, subtitle: albumsSubtitle },
-      { emoji: '🔖', label: 'Bookmarks', value: stats.aweCount, useGradient: true, subtitle: undefined },
+      { emoji: '🔖', label: 'Bookmarks', value: stats.bookmarkCount, useGradient: true, subtitle: undefined },
     ];
-  }, [stats.totalEntries, stats.totalJournals, stats.totalAlbums, stats.aweCount, longestTripDays]);
+  }, [stats.totalEntries, stats.totalJournals, stats.totalAlbums, stats.bookmarkCount, longestTripDays]);
 
   const placesCards = useMemo(() => [
     { emoji: '📍', label: 'Locations', value: stats.locationsCount, useGradient: false },

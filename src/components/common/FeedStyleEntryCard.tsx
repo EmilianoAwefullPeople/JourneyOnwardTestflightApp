@@ -90,7 +90,7 @@ const FeedStyleEntryCard: React.FC<Props> = ({ entry, width, aspectRatio = 3 / 4
       </View>
 
       {entry.title ? (
-        entry.isAwe ? (
+        entry.isBookmarked ? (
           <GradientText style={styles.title}>{entry.title}</GradientText>
         ) : (
           <Text style={styles.title} numberOfLines={2} maxFontSizeMultiplier={1.2}>

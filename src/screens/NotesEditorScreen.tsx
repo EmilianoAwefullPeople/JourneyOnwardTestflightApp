@@ -29,6 +29,7 @@ import { ANIMATION_CONFIG } from '../utils/animations';
 import { Journal } from '../models/Journal';
 import { generateUUID } from '../utils/uuid';
 
+
 interface GeocodedAddressWithLocality {
   city?: string;
   country?: string;

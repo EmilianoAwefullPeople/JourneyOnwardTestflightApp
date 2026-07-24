@@ -26,6 +26,7 @@ import TripAlbumsSection from '../components/review/TripAlbumsSection';
 import DashboardSection from '../components/review/DashboardSection';
 import { Entry } from '../models/Entry';
 import { Journal } from '../models/Journal';
+import { Postcard } from '../models/Postcard';
 import { TripAlbum } from '../models/TripAlbum';
 
 type ReviewScreenNavigationProp = NativeStackNavigationProp<RootStackParamList>;
@@ -34,7 +35,7 @@ const ReviewScreen: React.FC = () => {
   const navigation = useNavigation<ReviewScreenNavigationProp>();
   const route = useRoute<RouteProp<MainTabParamList, 'Review'>>();
   const insets = useSafeAreaInsets();
-  const { entries, journals, tripAlbums, travelModeEnabled, activeTripAlbums } = useAppContext();
+  const { entries, journals, tripAlbums, travelModeEnabled, activeTripAlbums, postcards } = useAppContext();
   const { colors, isDark } = useTheme();
   const { visibilityProgress, reportScrollOffset } = useMainTabBarVisibility();
   const [activeSection, setActiveSection] = useState<ReviewSection>(
@@ -99,6 +100,10 @@ const ReviewScreen: React.FC = () => {
   const handleJournalPress = (journal: Journal) => {
     navigation.navigate('JournalDetail', { journalId: journal.id });
   };
+
+  const handlePostcardPress = (postcard: Postcard) => {
+    navigation.navigate('PostcardEditor', { postcardId: postcard.id });
+  };
   
   const handleAlbumPress = (album: TripAlbum) => {
     navigation.navigate('TripAlbumDetail', { albumId: album.id });
@@ -110,6 +115,14 @@ const ReviewScreen: React.FC = () => {
 
   const handleSuggestTripsPress = () => {
     navigation.navigate('SuggestedAlbums');
+  };
+
+  const handleRecapPress = (album: TripAlbum) => {
+    navigation.navigate('JourneyRecapPlayer', { albumId: album.id });
+  };
+
+  const handleSlideshowPress = (album: TripAlbum) => {
+    navigation.navigate('MemoriesSlideshow', { albumId: album.id });
   };
   
   return (
@@ -134,8 +147,8 @@ const ReviewScreen: React.FC = () => {
             onSegmentChange={setActiveSection}
           />
         </View>
-        {/* Gallery (bookmarks) tucks "This Trip" into the All | Bookmarks row */}
-        {travelModeEnabled && normalizedSection !== 'bookmarks' && (
+        {/* "This Trip" is hidden on Your Trips (always show all albums) and on Gallery (tucked into the filter row) */}
+        {travelModeEnabled && normalizedSection === 'stats' && (
           <View style={styles.tripFilterRow}>
             <TouchableOpacity
               style={[styles.tripFilterButton, { backgroundColor: colors.surface }, !tripFilterActive && { opacity: 0.5 }]}
@@ -167,7 +180,11 @@ const ReviewScreen: React.FC = () => {
         >
           <BookmarksSection
             entries={displayEntries}
+            journals={displayJournals}
+            postcards={postcards}
             onEntryPress={handleEntryPress}
+            onJournalPress={handleJournalPress}
+            onPostcardPress={handlePostcardPress}
             scrollRef={bookmarksScrollRef}
             onScrollReport={reportScrollOffset}
             tabBarVisibilityProgress={visibilityProgress}
@@ -183,11 +200,14 @@ const ReviewScreen: React.FC = () => {
         <View style={[styles.sectionPanel, { display: normalizedSection === 'tripAlbums' ? 'flex' : 'none', backgroundColor: colors.background }]}>
           <TripAlbumsSection
             tripAlbums={tripAlbums}
-            entries={displayEntries}
-            journals={displayJournals}
+            activeTripAlbums={activeTripAlbums}
+            entries={entries ?? []}
+            journals={journals ?? []}
             onAlbumPress={handleAlbumPress}
             onCreateAlbumPress={handleCreateAlbumPress}
             onSuggestTripsPress={handleSuggestTripsPress}
+            onRecapPress={handleRecapPress}
+            onSlideshowPress={handleSlideshowPress}
             scrollRef={tripAlbumsScrollRef}
             onScrollReport={reportScrollOffset}
             tabBarVisibilityProgress={visibilityProgress}
@@ -199,6 +219,7 @@ const ReviewScreen: React.FC = () => {
             journals={displayJournals}
             tripAlbums={tripAlbums}
             tripFilterActive={tripFilterActive && activeTripAlbums.length > 0}
+            isVisible={normalizedSection === 'stats'}
             scrollRef={statsScrollRef}
             onScrollReport={reportScrollOffset}
             tabBarVisibilityProgress={visibilityProgress}

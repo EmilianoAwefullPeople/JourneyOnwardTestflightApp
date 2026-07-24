@@ -64,7 +64,7 @@ const T05iMessageTemplate = React.forwardRef<View, TemplateBaseProps>(
       if (slotData.photoUri) {
         return (
           <View style={photoStyle} key={index}>
-            {previewMode || editingChromeSuppressed ? (
+            {previewMode ? (
               <Image source={{ uri: slotData.photoUri }} style={StyleSheet.absoluteFill} resizeMode="cover" />
             ) : (
               <>

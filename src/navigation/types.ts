@@ -1,51 +1,21 @@
 // Navigation Types
 // Type definitions for React Navigation
 
-import type { OnboardingProfileDraft } from '../models/UserProfile';
 import type {
-  ImportLatestRange,
   PickedGalleryAsset,
   SuggestedExperienceWithDisplayUris,
 } from '../services/ImportLatestService';
 
-export type QSImportSelectionMode = 'date_range' | 'manual';
+export type UnpackTripDetailsParams = {
+  suggestions: SuggestedExperienceWithDisplayUris[];
+  inferredStartDate: string;
+  inferredEndDate: string;
+};
 
 export type RootStackParamList = {
-  Loading: undefined;
-  Welcome: undefined;
+  OnboardingSlides: undefined;
+  OnboardingPath: undefined;
   MainTabs: undefined | { screen?: keyof MainTabParamList; params?: { initialSection?: ReviewSectionParam } };
-  // Onboarding
-  OnboardingGate: undefined;
-  OnboardingPathSelect: { draft: OnboardingProfileDraft };
-  OnboardingQSCountry: { draft: OnboardingProfileDraft };
-  OnboardingQSImport: { draft: OnboardingProfileDraft; country: string };
-  OnboardingQSSelectExperiences: {
-    draft: OnboardingProfileDraft;
-    country: string;
-    mode: QSImportSelectionMode;
-    range?: ImportLatestRange;
-    pickedAssets?: PickedGalleryAsset[];
-  };
-  OnboardingQSProcessing: {
-    draft: OnboardingProfileDraft;
-    country: string;
-    pickedAssets: PickedGalleryAsset[];
-  };
-  OnboardingQSExperiences: {
-    draft: OnboardingProfileDraft;
-    country: string;
-    selectedSuggestions: SuggestedExperienceWithDisplayUris[];
-  };
-  OnboardingQSGenerating: {
-    draft: OnboardingProfileDraft;
-    country: string;
-    selectedSuggestions: SuggestedExperienceWithDisplayUris[];
-    note?: string;
-  };
-  OnboardingQSResults: { draft: OnboardingProfileDraft; albumId: string };
-  OnboardingQSEmail: { draft: OnboardingProfileDraft; albumId: string };
-  OnboardingTutorial: { draft: OnboardingProfileDraft; resumeStep?: number };
-  OnboardingTutorialExit: undefined;
   Capture: undefined;
   CaptureSaved: { entryId: string; previewFirstPhotoUri?: string };
   EntryDetail: { entryId: string };
@@ -68,12 +38,46 @@ export type RootStackParamList = {
   JourneyRecapCandidates: undefined;
   JourneyRecapPlayer: { albumId: string };
   JourneyRecapPost: { albumId: string };
+  MemoriesSlideshow: { albumId: string };
   FullCountryCalendar: undefined;
+  /** dayKey format: `${year}-${monthIndex0}-${day}` (local calendar day, matches dayKeyUtils). */
+  DayDetail: { dayKey: string };
   CountryRankingFullList: { rows: { country: string; memories: number }[] };
+  CountriesVisitedMapFull: { visitedIsoCodes: string[]; countryNames: string[] };
   PostcardTemplates: undefined;
   PostcardEditor: { templateId?: string; postcardId?: string };
   SavedPostcards: undefined;
+  PostcardStoryEditor: { photoUri: string; entryId?: string };
   SuggestedAlbums: undefined;
+  // Unpack A Trip flow
+  UnpackTripDetails: UnpackTripDetailsParams | undefined;
+  UnpackAddMemories: {
+    albumId?: string;
+    tripStartDate?: string;
+    tripEndDate?: string;
+    // Album metadata carried forward — album is not persisted to DB until Stage 3
+    albumName?: string;
+    albumDescription?: string;
+  };
+  UnpackProcessing: {
+    albumId?: string;
+    pickedAssets: PickedGalleryAsset[];
+    // Album metadata forwarded from UnpackAddMemories → UnpackHighlight
+    albumName?: string;
+    albumStartDate?: string;
+    albumEndDate?: string;
+    albumDescription?: string;
+  };
+  UnpackHighlight: {
+    albumId: string;
+    suggestions: SuggestedExperienceWithDisplayUris[];
+    // Present when album has not been persisted to DB yet (deferred from Stage 1)
+    albumName?: string;
+    albumStartDate?: string;
+    albumEndDate?: string;
+    albumDescription?: string;
+  };
+  UnpackUnpacking: { albumId: string; highlightedIds: string[] };
 };
 
 export type ReviewSectionParam = 'bookmarks' | 'journal' | 'map' | 'timeline' | 'tripAlbums' | 'stats';
