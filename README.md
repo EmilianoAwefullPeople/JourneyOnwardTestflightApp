@@ -17,7 +17,7 @@ Built for iOS (TestFlight / App Store) u
 
 ## Tech Stack
 
-- [Expo](https://expo.dev) / React Nativ
+- [Expo](https://expo.dev) / React Native
 - TypeScript
 - SQLite (`expo-sqlite`) for structured rip albums)
 - AsyncStorage for user preferences (theme, onboarding state, travel mode)
